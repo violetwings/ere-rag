@@ -1,6 +1,13 @@
-# Research Repository Template
+# ERE-RAG: Retrieval-Augmented Event Relation Extraction
 
-This repository is a GitLab-first template for research, exploratory engineering, and data science seminar work. It is designed for projects where code, experiments, notes, and final reports evolve together and must stay traceable in version control.
+Master's thesis project — University of Passau, 2026.
+
+This project investigates whether dense retrieval can replace exhaustive 
+pairwise enumeration in event relation extraction, combining a fine-tuned 
+S-BERT retriever with partitioned batch LLM reasoning for causal and 
+temporal relation extraction on MAVEN-ERE.
+
+See `docs/project-plan.md` for the full research plan and hypothesis.
 
 The template supports a research loop like the one presented in "Scientific Working I — The Research Loop":
 
@@ -373,3 +380,85 @@ This repository is a template stub. It is intentionally lightweight, but it shou
 ## License
 
 This template ships with the MIT License. Replace it if needed.
+
+## Setup
+
+### 1. Clone the repository
+
+```bash
+git clone https://git.fim.uni-passau.de/nourellil/ere-rag.git
+cd ere-rag
+```
+
+### 2. Create and activate virtual environment
+
+```bash
+python3.10 -m venv venv
+source venv/bin/activate  # Mac/Linux
+venv\Scripts\activate     # Windows
+```
+
+### 3. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Install LLaMA-Factory from source
+
+```bash
+git clone https://github.com/hiyouga/LLaMA-Factory.git
+cd LLaMA-Factory
+pip install -e .
+cd ..
+```
+
+### 5. Download MAVEN-ERE
+
+Download the dataset from https://github.com/THU-KEG/MAVEN-ERE 
+and place the files in `data/raw/`.
+
+## Data
+
+MAVEN-ERE is the primary benchmark. Due to compute constraints, 
+experiments are conducted on a fixed 15% random-seed subset 
+(seed=42) of the full dataset.
+
+## Reproducing Results
+
+### Step 1 — Preprocess the data
+```bash
+python src/ere-rag/data/preprocess.py
+```
+
+### Step 2 — Run the RoBERTa baseline
+```bash
+python src/ere-rag/evaluation/baseline_roberta.py
+```
+
+### Step 3 — Fine-tune the S-BERT retriever
+```bash
+python src/ere-rag/retriever/train_retriever.py
+```
+
+### Step 4 — Build the FAISS index
+```bash
+python src/ere-rag/retriever/build_index.py
+```
+
+### Step 5 — Run the full pipeline
+```bash
+python src/ere-rag/llm/inference.py
+```
+
+## Requirements
+
+- Python 3.10
+- See requirements.txt for full dependency list
+- GPU recommended for LLM inference (Llama3-8B)
+
+## References
+
+- MAVEN-ERE: Wang et al., EMNLP 2022
+- Efficient ERE: Liu et al., COLING 2025
+- LLMERE: Wei et al., ACL 2025

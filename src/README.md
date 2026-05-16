@@ -1,5 +1,8 @@
 # Source Code
 
-Place reusable project code in this directory.
+Main package: `ere_rag/`
 
-Rename `project_name/` to the actual package name before starting implementation.
+- `data/`: data loading and preprocessing scripts
+- `retriever/`: S-BERT fine-tuning and FAISS index construction  
+- `llm/`: prompt design and Llama3 inference
+- `evaluation/`: precision, recall, F1 computation and baseline scripts

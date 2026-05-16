@@ -1,0 +1,32 @@
+# Python version: 3.10
+
+# Core ML
+torch==2.2.2
+torchvision==0.17.2
+
+# HuggingFace ecosystem
+transformers==4.40.0
+datasets==2.19.0
+accelerate==0.29.3
+peft==0.10.0
+
+# Sentence transformers for S-BERT
+sentence-transformers==2.7.0
+
+# FAISS for nearest neighbor search
+faiss-cpu==1.8.0
+
+# LLaMA-Factory for LLM fine-tuning
+# Install separately from source — see README
+
+# Evaluation and data processing
+scikit-learn==1.4.2
+pandas==2.2.2
+numpy==1.26.4
+
+# Utilities
+tqdm==4.66.4
+python-dotenv==1.0.1
+
+# Experiment tracking
+tensorboard==2.16.2
