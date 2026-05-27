@@ -1,15 +1,18 @@
 [project]
-name = "project-name"
+name = "ere_rag"
 version = "0.1.0"
 description = "Research repository template for experimental and documentation-driven work."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-  { name = "Your Name" }
+  { name = "Hafsa NOUR ELLIL" }
 ]
 dependencies = []
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

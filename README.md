@@ -1,4 +1,4 @@
-# ERE-RAG: Retrieval-Augmented Event Relation Extraction
+# ere_rag: Retrieval-Augmented Event Relation Extraction
 
 Master's thesis project — University of Passau, 2026.
 
@@ -386,8 +386,8 @@ This template ships with the MIT License. Replace it if needed.
 ### 1. Clone the repository
 
 ```bash
-git clone https://git.fim.uni-passau.de/nourellil/ere-rag.git
-cd ere-rag
+git clone https://git.fim.uni-passau.de/nourellil/ere_rag.git
+cd ere_rag
 ```
 
 ### 2. Create and activate virtual environment
@@ -428,27 +428,27 @@ experiments are conducted on a fixed 15% random-seed subset
 
 ### Step 1 — Preprocess the data
 ```bash
-python src/ere-rag/data/preprocess.py
+python src/ere_rag/data/preprocess.py
 ```
 
 ### Step 2 — Run the RoBERTa baseline
 ```bash
-python src/ere-rag/evaluation/baseline_roberta.py
+python src/ere_rag/evaluate/baseline_roberta.py
 ```
 
 ### Step 3 — Fine-tune the S-BERT retriever
 ```bash
-python src/ere-rag/retriever/train_retriever.py
+python src/ere_rag/retriever/train_retriever.py
 ```
 
 ### Step 4 — Build the FAISS index
 ```bash
-python src/ere-rag/retriever/build_index.py
+python src/ere_rag/retriever/build_index.py
 ```
 
 ### Step 5 — Run the full pipeline
 ```bash
-python src/ere-rag/llm/inference.py
+python src/ere_rag/llm/inference.py
 ```
 
 ## Requirements

@@ -1,0 +1,12 @@
+batch_size: 4
+bert_lr: 1.0e-05
+data_dir: data/raw/MAVEN_ERE
+device: cpu
+epochs: 5
+eval_steps: 37
+ignore_nonetype: false
+log_steps: 37
+lr: 0.0001
+model: roberta-base
+sample_rate: 0.05
+seed: 42

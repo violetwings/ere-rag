@@ -1,7 +1,7 @@
 """
 preprocess.py
 
-Preprocesses MAVEN-ERE for the ERE-RAG pipeline.
+Preprocesses MAVEN-ERE for the ere_rag pipeline.
 
 What this script does:
 1. Loads train.jsonl and valid.jsonl from data/raw/MAVEN_ERE/
@@ -308,7 +308,7 @@ def process_split(documents, split_name, output_dir, seed):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Preprocess MAVEN-ERE for ERE-RAG pipeline'
+        description='Preprocess MAVEN-ERE for ere_rag pipeline'
     )
     parser.add_argument(
         '--data_dir', type=str, default='data/raw/MAVEN_ERE',

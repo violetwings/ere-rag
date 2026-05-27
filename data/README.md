@@ -5,7 +5,7 @@
 Run from the project root:
 
 ```bash
-python src/ere-rag/data/download.py
+python src/ere_rag/data/download.py
 ```
 
 This downloads MAVEN-ERE into `data/raw/MAVEN_ERE/`.
@@ -15,7 +15,7 @@ This downloads MAVEN-ERE into `data/raw/MAVEN_ERE/`.
 Run from the project root:
 
 ```bash
-python src/ere-rag/data/preprocess.py
+python src/ere_rag/data/preprocess.py
 ```
 
 This creates the following files in `data/processed/`:

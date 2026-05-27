@@ -55,6 +55,11 @@ wandb/
 mlruns/
 tensorboard/
 lightning_logs/
+experiments/*/*/log.txt
+experiments/*/*/test_prediction.jsonl
+experiments/*/*/best
+experiments/**/*.bin
+experiments/**/*.pt
 
 # Data files commonly kept outside git
 data/raw/*

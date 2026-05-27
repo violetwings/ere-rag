@@ -1,0 +1,21 @@
+{
+  "run": "seed42_sr0.15_ep5_bs1_mps",
+  "device": "mps",
+  "seed": 42,
+  "sample_rate": 0.15,
+  "epochs": 20,
+  "batch_size": 4,
+  "eval_steps": 100,
+  "best_checkpoint": {
+    "selected_by": "micro_avg_f1",
+    "precision": 0.2519,
+    "recall": 0.1874,
+    "f1": 0.2149
+  },
+  "paper_reference": {
+    "causal_precision": 35.0,
+    "causal_recall": 27.2,
+    "causal_f1": 30.6,
+    "note": "Wang et al. 2022, full dataset, GPU"
+  }
+}
