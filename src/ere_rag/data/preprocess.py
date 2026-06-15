@@ -1,370 +1,371 @@
 """
 preprocess.py
 
-Preprocesses MAVEN-ERE for the ere_rag pipeline.
+Preprocesses MAVEN-ERE for the ere_rag pipeline, producing
+valid_pairs.jsonl (and train_pairs.jsonl) in data/processed/.
 
-What this script does:
-1. Loads train.jsonl and valid.jsonl from data/raw/MAVEN_ERE/
-2. Creates a 15% random-seed subset of each split
-3. Extracts event pairs with temporal and causal relation labels
-4. Extracts negative pairs (same document, no annotated relation)
-5. Saves everything to data/processed/
+These files are consumed by build_index.py for retrieval evaluation.
+
+Design decisions — derived from the two baseline data.py files:
+
+  Temporal pairs (temporal/data.py):
+    - Event pool = event mentions + TIMEX mentions (time expressions).
+      The baseline adds every TIMEX to the event list; omitting them
+      would miss all temporal relations involving "yesterday", "2003", etc.
+    - Relations expanded from event-chain level to all mention pairs
+      (not just first mention per chain).
+    - SIMULTANEOUS and BEGINS-ON are symmetric: (e1,e2) and (e2,e1)
+      both get the relation label, matching baseline behaviour.
+    - Pairs with abs(sent_id diff) > 1 are labelled NOREL (not -100),
+      because we need concrete negative examples for retrieval evaluation.
+
+  Causal pairs (causal/data.py):
+    - Event pool = event mentions only (no TIMEX).
+    - Relations: CAUSE and PRECONDITION only. NONE otherwise.
+    - No symmetry expansion.
+
+  Sentences:
+    - Reconstructed by joining the token list for the event's sentence,
+      exactly as the baseline tokenizer does. This is more reliable than
+      using a pre-built "sentences" field which may be absent or
+      inconsistently formatted.
+
+Output schema per row (same for temporal and causal):
+    {
+      "doc_id":            str,
+      "head_mention_id":   str,
+      "head_trigger":      str,          # trigger_word for events, mention for TIMEX
+      "head_sent_id":      int,
+      "head_sentence":     str,          # tokens[sent_id] joined
+      "tail_mention_id":   str,
+      "tail_trigger":      str,
+      "tail_sent_id":      int,
+      "tail_sentence":     str,
+      "relation_type":     str,          # e.g. "BEFORE", "CAUSE", "NOREL"
+      "relation_category": str,          # "temporal" or "causal"
+      "label":             str           # same as relation_type; "NOREL" for negatives
+    }
 
 Usage:
-    python src/ere_rag/data/preprocess.py
+    python src/ere_rag/data/preprocess.py \
+        --data_dir data/raw/MAVEN_ERE \
+        --output_dir data/processed 
 """
 
 import json
-import random
 import argparse
 from pathlib import Path
 from collections import defaultdict
-from itertools import combinations
-
-from load_data import (
-    load_split,
-    get_event_mentions,
-    get_event_id_to_mentions,
-    get_temporal_relation_pairs,
-    get_causal_relation_pairs,
-    get_sentence,
-    TEMPORAL_RELATION_TYPES,
-    CAUSAL_RELATION_TYPES,
-)
-
-# ── Constants ──────────────────────────────────────────────────────────────
-
-RANDOM_SEED = 42
-SUBSET_FRACTION = 0.15
-NO_RELATION_LABEL = "NOREL"
-
-# How many hard negatives to sample per document
-# Too many makes training data huge, too few hurts the retriever
-NEGATIVES_PER_POSITIVE = 3
 
 
-# ── Subsetting ─────────────────────────────────────────────────────────────
+# ── Relation constants ─────────────────────────────────────────────────────
 
-def create_subset(documents, fraction, seed):
+TEMPORAL_RELS = {"BEFORE", "OVERLAP", "CONTAINS", "SIMULTANEOUS", "ENDS-ON", "BEGINS-ON"}
+# Symmetric temporal relations — (e2,e1) gets the same label as (e1,e2)
+TEMPORAL_SYMMETRIC = {"SIMULTANEOUS", "BEGINS-ON"}
+
+CAUSAL_RELS = {"CAUSE", "PRECONDITION"}
+
+NOREL = "NOREL"
+
+
+# ── Sentence reconstruction ────────────────────────────────────────────────
+
+def get_sentence(document_data: dict, sent_id: int) -> str:
     """
-    Sample a fixed random subset of documents.
-    
-    Args:
-        documents: full list of document dicts
-        fraction: proportion to keep e.g. 0.15
-        seed: random seed for reproducibility
-    
+    Reconstruct a sentence by joining the token list for that sentence.
+
+    This matches what the baseline tokenizers do: they iterate over
+    document_data["tokens"] (a list of lists of strings, one per sentence)
+    and join with spaces. Using a pre-built "sentences" field is unreliable
+    because it may be absent or formatted differently across dataset versions.
+    """
+    tokens = document_data.get("tokens", [])
+    if sent_id < len(tokens):
+        return " ".join(tokens[sent_id])
+    return ""
+
+
+def get_trigger(event: dict) -> str:
+    """
+    Return the trigger word for an event mention or TIMEX.
+    Event mentions use 'trigger_word'; TIMEX entries use 'mention'.
+    """
+    return event.get("trigger_word") or event.get("mention", "")
+
+
+# ── Event pool construction ────────────────────────────────────────────────
+
+def build_event_pool_temporal(document_data: dict) -> tuple[list[dict], dict[str, list[str]]]:
+    """
+    Build the temporal event pool: event mentions + TIMEX.
+
+    Matches temporal/data.py Document.__init__:
+      for e in data["events"]: pool += e["mention"]
+      for t in data["TIMEX"]:  pool.append(t)
+
     Returns:
-        subset list of document dicts
+      events:       sorted list of mention/TIMEX dicts
+      eid2mentions: event-chain-id -> list of mention ids
     """
-    rng = random.Random(seed)
-    subset_size = max(1, int(len(documents) * fraction))
-    subset = rng.sample(documents, subset_size)
-    print(f"  Subset: {subset_size} / {len(documents)} documents "
-          f"({fraction*100:.0f}%, seed={seed})")
-    return subset
+    events = []
+    eid2mentions: dict[str, list[str]] = {}
+
+    if "events" in document_data:
+        for chain in document_data["events"]:
+            for mention in chain["mention"]:
+                events.append(mention)
+            eid2mentions[chain["id"]] = [m["id"] for m in chain["mention"]]
+
+    for timex in document_data.get("TIMEX", []):
+        events.append(timex)
+        eid2mentions[timex["id"]] = [timex["id"]]
+
+    # Sort by sentence then token offset, matching baseline sort_events()
+    events.sort(key=lambda e: (e["sent_id"], e["offset"][0]))
+    return events, eid2mentions
 
 
-# ── Event pair extraction ──────────────────────────────────────────────────
+def build_event_pool_causal(document_data: dict) -> tuple[list[dict], dict[str, list[str]]]:
+    """
+    Build the causal event pool: event mentions only (no TIMEX).
 
-def get_annotated_relation_pairs(document):
+    Matches causal/data.py Document.__init__:
+      for e in data["events"]: pool += e["mention"]
+      (no TIMEX addition)
     """
-    Get all annotated positive relation pairs at the MENTION level.
-    
-    MAVEN-ERE stores relations at the event chain level.
-    We expand them to mention level because:
-    - The retriever works on mention embeddings
-    - Predictions are submitted at mention level
-    
-    For each event chain pair with a relation, we create one pair
-    using the first mention of each chain (following common practice).
-    
-    Returns:
-        list of dicts with keys:
-            head_mention_id, head_trigger, head_sent_id,
-            tail_mention_id, tail_trigger, tail_sent_id,
-            relation_type, relation_category (temporal/causal),
-            head_sentence, tail_sentence,
-            doc_id
+    events = []
+    eid2mentions: dict[str, list[str]] = {}
+
+    if "events" in document_data:
+        for chain in document_data["events"]:
+            for mention in chain["mention"]:
+                events.append(mention)
+            eid2mentions[chain["id"]] = [m["id"] for m in chain["mention"]]
+
+    events.sort(key=lambda e: (e["sent_id"], e["offset"][0]))
+    return events, eid2mentions
+
+
+# ── Label map construction ─────────────────────────────────────────────────
+
+def build_temporal_label_map(
+    document_data: dict,
+    eid2mentions: dict[str, list[str]],
+) -> dict[tuple[str, str], str]:
     """
-    doc_id = document['id']
-    event_id_to_mentions = get_event_id_to_mentions(document)
+    Build (mention_id, mention_id) -> relation_type for temporal relations.
+
+    Expands chain-level pairs to all mention-level pairs (not just first
+    mention), matching baseline get_labels() behaviour. Applies symmetry
+    for SIMULTANEOUS and BEGINS-ON.
+    """
+    pair2rel: dict[tuple[str, str], str] = {}
+    relations = document_data.get("temporal_relations", {})
+
+    for rel_type, pairs in relations.items():
+        if rel_type not in TEMPORAL_RELS:
+            continue
+        for chain_pair in pairs:
+            eid1, eid2 = chain_pair[0], chain_pair[1]
+            for m1 in eid2mentions.get(eid1, [eid1]):
+                for m2 in eid2mentions.get(eid2, [eid2]):
+                    pair2rel[(m1, m2)] = rel_type
+                    if rel_type in TEMPORAL_SYMMETRIC:
+                        pair2rel[(m2, m1)] = rel_type
+
+    return pair2rel
+
+
+def build_causal_label_map(
+    document_data: dict,
+    eid2mentions: dict[str, list[str]],
+) -> dict[tuple[str, str], str]:
+    """
+    Build (mention_id, mention_id) -> relation_type for causal relations.
+
+    No symmetry expansion — causal relations are directional.
+    """
+    pair2rel: dict[tuple[str, str], str] = {}
+    relations = document_data.get("causal_relations", {})
+
+    for rel_type, pairs in relations.items():
+        if rel_type not in CAUSAL_RELS:
+            continue
+        for chain_pair in pairs:
+            eid1, eid2 = chain_pair[0], chain_pair[1]
+            for m1 in eid2mentions.get(eid1, [eid1]):
+                for m2 in eid2mentions.get(eid2, [eid2]):
+                    pair2rel[(m1, m2)] = rel_type
+
+    return pair2rel
+
+
+# ── Pair extraction ────────────────────────────────────────────────────────
+
+def extract_pairs_from_document(
+    document_data: dict,
+    category: str,          # "temporal" or "causal"
+) -> list[dict]:
+    """
+    Extract all ordered event-mention pairs from one document,
+    labelling each as a named relation type or NOREL.
+
+    For temporal: includes TIMEX events, all mention expansions,
+                  symmetric labels for SIMULTANEOUS/BEGINS-ON.
+    For causal:   event mentions only, directional relations only.
+
+    Returns a flat list of pair dicts in the schema described in the
+    module docstring.
+    """
+    doc_id = document_data["id"]
+
+    if category == "temporal":
+        events, eid2mentions = build_event_pool_temporal(document_data)
+        pair2rel = build_temporal_label_map(document_data, eid2mentions)
+    else:
+        events, eid2mentions = build_event_pool_causal(document_data)
+        pair2rel = build_causal_label_map(document_data, eid2mentions)
+
+    if len(events) < 2:
+        return []
+
     pairs = []
-
-    def add_pairs(raw_pairs, category):
-        for raw_pair in raw_pairs:
-            head_event_id = raw_pair['head_id']
-            tail_event_id = raw_pair['tail_id']
-            rel_type = raw_pair['relation_type']
-
-            # Skip if either ID is a TIMEX (starts with TIME_)
-            # We focus on event-event relations only
-            if (head_event_id.startswith('TIME_') or
-                    tail_event_id.startswith('TIME_')):
+    for e1 in events:
+        for e2 in events:
+            if e1["id"] == e2["id"]:
                 continue
 
-            head_mentions = event_id_to_mentions.get(head_event_id, [])
-            tail_mentions = event_id_to_mentions.get(tail_event_id, [])
-
-            if not head_mentions or not tail_mentions:
-                continue
-
-            # Use first mention of each chain
-            head = head_mentions[0]
-            tail = tail_mentions[0]
+            rel = pair2rel.get((e1["id"], e2["id"]), NOREL)
 
             pairs.append({
-                'doc_id': doc_id,
-                'head_mention_id': head['mention_id'],
-                'head_trigger': head['trigger_word'],
-                'head_sent_id': head['sent_id'],
-                'head_sentence': get_sentence(document, head['sent_id']),
-                'tail_mention_id': tail['mention_id'],
-                'tail_trigger': tail['trigger_word'],
-                'tail_sent_id': tail['sent_id'],
-                'tail_sentence': get_sentence(document, tail['sent_id']),
-                'relation_type': rel_type,
-                'relation_category': category,
-                'label': rel_type,
+                "doc_id":            doc_id,
+                "head_mention_id":   e1["id"],
+                "head_trigger":      get_trigger(e1),
+                "head_sent_id":      e1["sent_id"],
+                "head_sentence":     get_sentence(document_data, e1["sent_id"]),
+                "tail_mention_id":   e2["id"],
+                "tail_trigger":      get_trigger(e2),
+                "tail_sent_id":      e2["sent_id"],
+                "tail_sentence":     get_sentence(document_data, e2["sent_id"]),
+                "relation_type":     rel,
+                "relation_category": category,
+                "label":             rel,
             })
-
-    add_pairs(get_temporal_relation_pairs(document), 'temporal')
-    add_pairs(get_causal_relation_pairs(document), 'causal')
 
     return pairs
 
 
-def get_negative_pairs(document, positive_pairs, n_per_positive, seed):
-    """
-    Sample hard negative pairs from the same document.
-    
-    Hard negatives: event mention pairs from the same document
-    that have NO annotated relation. These are harder to distinguish
-    than random negatives because they share document context.
-    
-    Args:
-        document: document dict
-        positive_pairs: list of already-extracted positive pairs
-        n_per_positive: how many negatives to sample per positive pair
-        seed: random seed
-    
-    Returns:
-        list of dicts in same format as positive pairs but with NOREL label
-    """
-    doc_id = document['id']
-    rng = random.Random(seed)
+# ── I/O helpers ────────────────────────────────────────────────────────────
 
-    # Collect all mention IDs involved in positive pairs
-    positive_pair_set = set()
-    for pair in positive_pairs:
-        positive_pair_set.add(
-            (pair['head_mention_id'], pair['tail_mention_id'])
-        )
-        # Also add reverse to avoid symmetric duplicates
-        positive_pair_set.add(
-            (pair['tail_mention_id'], pair['head_mention_id'])
-        )
-
-    # Get all event mentions in this document
-    mentions = get_event_mentions(document)
-    if len(mentions) < 2:
-        return []
-
-    # Generate all possible mention pairs not in positive set
-    candidate_negatives = []
-    for m1, m2 in combinations(mentions, 2):
-        pair_key = (m1['mention_id'], m2['mention_id'])
-        reverse_key = (m2['mention_id'], m1['mention_id'])
-        if pair_key not in positive_pair_set and \
-                reverse_key not in positive_pair_set:
-            candidate_negatives.append((m1, m2))
-
-    # Sample a limited number
-    n_to_sample = min(
-        len(candidate_negatives),
-        n_per_positive * len(positive_pairs)
-    )
-    sampled = rng.sample(candidate_negatives, n_to_sample)
-
-    negative_pairs = []
-    for m1, m2 in sampled:
-        negative_pairs.append({
-            'doc_id': doc_id,
-            'head_mention_id': m1['mention_id'],
-            'head_trigger': m1['trigger_word'],
-            'head_sent_id': m1['sent_id'],
-            'head_sentence': get_sentence(document, m1['sent_id']),
-            'tail_mention_id': m2['mention_id'],
-            'tail_trigger': m2['trigger_word'],
-            'tail_sent_id': m2['sent_id'],
-            'tail_sentence': get_sentence(document, m2['sent_id']),
-            'relation_type': NO_RELATION_LABEL,
-            'relation_category': 'none',
-            'label': NO_RELATION_LABEL,
-        })
-
-    return negative_pairs
+def load_jsonl(filepath: Path) -> list[dict]:
+    docs = []
+    with open(filepath, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                docs.append(json.loads(line))
+    return docs
 
 
-# ── Saving ─────────────────────────────────────────────────────────────────
-
-def save_jsonl(data, filepath):
-    """Save a list of dicts as a .jsonl file."""
-    filepath = Path(filepath)
+def save_jsonl(rows: list[dict], filepath: Path) -> None:
     filepath.parent.mkdir(parents=True, exist_ok=True)
-    with open(filepath, 'w', encoding='utf-8') as f:
-        for item in data:
-            f.write(json.dumps(item) + '\n')
-    print(f"  Saved {len(data)} records to {filepath}")
+    with open(filepath, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    print(f"    Saved {len(rows):,} rows → {filepath}")
 
 
-def save_json(data, filepath):
-    """Save a dict as a .json file."""
-    filepath = Path(filepath)
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2)
-    print(f"  Saved to {filepath}")
+def print_stats(pairs: list[dict], label: str) -> None:
+    total    = len(pairs)
+    positive = sum(1 for p in pairs if p["label"] != NOREL)
+    norel    = total - positive
+    temporal = sum(1 for p in pairs if p["relation_category"] == "temporal" and p["label"] != NOREL)
+    causal   = sum(1 for p in pairs if p["relation_category"] == "causal"   and p["label"] != NOREL)
 
+    # Relation type breakdown
+    by_type: dict[str, int] = defaultdict(int)
+    for p in pairs:
+        if p["label"] != NOREL:
+            by_type[p["label"]] += 1
 
-# ── Statistics ─────────────────────────────────────────────────────────────
-
-def compute_pair_statistics(pairs, split_name):
-    """Print statistics about extracted pairs."""
-    total = len(pairs)
-    temporal = [p for p in pairs if p['relation_category'] == 'temporal']
-    causal = [p for p in pairs if p['relation_category'] == 'causal']
-    negative = [p for p in pairs if p['label'] == NO_RELATION_LABEL]
-
-    temporal_types = defaultdict(int)
-    for p in temporal:
-        temporal_types[p['relation_type']] += 1
-
-    causal_types = defaultdict(int)
-    for p in causal:
-        causal_types[p['relation_type']] += 1
-
-    print(f"\n--- Pair statistics for {split_name} ---")
-    print(f"Total pairs:       {total}")
-    print(f"Temporal positive: {len(temporal)}")
-    for t, c in temporal_types.items():
-        print(f"  {t}: {c}")
-    print(f"Causal positive:   {len(causal)}")
-    for t, c in causal_types.items():
-        print(f"  {t}: {c}")
-    print(f"Negative (NOREL):  {len(negative)}")
-    if len(temporal) + len(causal) > 0:
-        ratio = len(negative) / (len(temporal) + len(causal))
-        print(f"Negative/positive ratio: {ratio:.2f}")
-
-    return {
-        'total_pairs': total,
-        'temporal_positive': len(temporal),
-        'causal_positive': len(causal),
-        'negative': len(negative),
-        'temporal_type_distribution': dict(temporal_types),
-        'causal_type_distribution': dict(causal_types),
-    }
+    print(f"  [{label}]  total={total:,}  positive={positive:,}  norel={norel:,}")
+    print(f"    temporal positives: {temporal:,}  |  causal positives: {causal:,}")
+    for rel, count in sorted(by_type.items()):
+        print(f"    {rel}: {count:,}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
-def process_split(documents, split_name, output_dir, seed):
-    """
-    Process one split: extract pairs, sample negatives, save.
-    """
-    print(f"\nProcessing {split_name} split ({len(documents)} documents)...")
-
-    all_pairs = []
-    docs_skipped = 0
-
-    for doc in documents:
-        # Get positive pairs
-        positive_pairs = get_annotated_relation_pairs(doc)
-
-        if not positive_pairs:
-            docs_skipped += 1
-            # Still include the document but with no pairs
-            continue
-
-        # Get negative pairs
-        negative_pairs = get_negative_pairs(
-            doc, positive_pairs, NEGATIVES_PER_POSITIVE, seed
-        )
-
-        all_pairs.extend(positive_pairs)
-        all_pairs.extend(negative_pairs)
-
-    print(f"  Documents skipped (no relations): {docs_skipped}")
-
-    # Save pairs
-    output_path = Path(output_dir) / f"{split_name}_pairs.jsonl"
-    save_jsonl(all_pairs, output_path)
-
-    # Compute and return statistics
-    stats = compute_pair_statistics(all_pairs, split_name)
-    return stats
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description='Preprocess MAVEN-ERE for ere_rag pipeline'
+        description="Preprocess MAVEN-ERE → data/processed/[train|valid]_pairs.jsonl"
     )
-    parser.add_argument(
-        '--data_dir', type=str, default='data/raw/MAVEN_ERE',
-        help='Path to MAVEN_ERE folder containing train.jsonl and valid.jsonl'
-    )
-    parser.add_argument(
-        '--output_dir', type=str, default='data/processed',
-        help='Where to save processed files'
-    )
-    parser.add_argument(
-        '--seed', type=int, default=RANDOM_SEED,
-        help='Random seed for subsetting and negative sampling'
-    )
-    parser.add_argument(
-        '--fraction', type=float, default=SUBSET_FRACTION,
-        help='Fraction of documents to keep in subset'
-    )
+    parser.add_argument("--data_dir",   type=str, default="data/raw/MAVEN_ERE")
+    parser.add_argument("--output_dir", type=str, default="data/processed")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
-    all_stats = {}
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    for split in ['train', 'valid']:
-        print(f"\n{'='*50}")
-        print(f"Loading {split} split from {args.data_dir}...")
+    all_stats: dict = {}
 
-        try:
-            documents = load_split(args.data_dir, split)
-        except FileNotFoundError as e:
-            print(f"  Skipping: {e}")
+    for split in ["train", "valid"]:
+        print(f"\n{'='*55}")
+        print(f"Split: {split}")
+        jsonl_path = Path(args.data_dir) / f"{split}.jsonl"
+        if not jsonl_path.exists():
+            print(f"  Not found: {jsonl_path}, skipping.")
             continue
 
-        # Create subset
-        print(f"Creating {args.fraction*100:.0f}% subset...")
-        subset = create_subset(documents, args.fraction, args.seed)
+        documents = load_jsonl(jsonl_path)
+        print(f"  Loaded {len(documents):,} documents")
 
-        # Save subset documents
-        subset_path = output_dir / f"subset_{split}.jsonl"
-        save_jsonl(subset, subset_path)
+        temporal_pairs: list[dict] = []
+        causal_pairs:   list[dict] = []
+        skipped = 0
 
-        # Extract and save pairs
-        stats = process_split(subset, split, output_dir, args.seed)
-        all_stats[split] = stats
+        for doc in documents:
+            try:
+                tp = extract_pairs_from_document(doc, "temporal")
+                cp = extract_pairs_from_document(doc, "causal")
+            except Exception as e:
+                print(f"  Warning: skipped {doc.get('id','?')} — {e}")
+                skipped += 1
+                continue
 
-    # Save overall statistics
-    stats_path = output_dir / "stats.json"
-    save_json(all_stats, stats_path)
+            temporal_pairs.extend(tp)
+            causal_pairs.extend(cp)
 
-    print(f"\n{'='*50}")
-    print("Preprocessing complete.")
-    print(f"Output files in: {output_dir}")
-    print("\nFiles created:")
-    for f in sorted(output_dir.glob("*")):
-        size_mb = f.stat().st_size / 1024 / 1024
-        print(f"  {f.name} ({size_mb:.1f} MB)")
+        if skipped:
+            print(f"  Skipped {skipped} documents due to errors")
+
+        # Merge: one combined file (used by build_index.py)
+        all_pairs = temporal_pairs + causal_pairs
+
+        print_stats(all_pairs, split)
+
+        save_jsonl(all_pairs,      output_dir / f"{split}_pairs.jsonl")
+        save_jsonl(temporal_pairs, output_dir / f"{split}_temporal_pairs.jsonl")
+        save_jsonl(causal_pairs,   output_dir / f"{split}_causal_pairs.jsonl")
+
+        n_pos_t = sum(1 for p in temporal_pairs if p["label"] != NOREL)
+        n_pos_c = sum(1 for p in causal_pairs   if p["label"] != NOREL)
+        all_stats[split] = {
+            "n_documents":           len(documents) - skipped,
+            "temporal_pairs":        len(temporal_pairs),
+            "temporal_positives":    n_pos_t,
+            "causal_pairs":          len(causal_pairs),
+            "causal_positives":      n_pos_c,
+            "total_pairs":           len(all_pairs),
+            "total_positives":       n_pos_t + n_pos_c,
+        }
+
+    with open(output_dir / "stats.json", "w") as f:
+        json.dump(all_stats, f, indent=2)
+    print(f"\nStats → {output_dir / 'stats.json'}")
+    print("\nDone.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

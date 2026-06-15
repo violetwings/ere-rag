@@ -93,3 +93,22 @@ docs/_build/
 
 # Local package manager files
 node_modules/
+
+# LLM cache script
+src/ere_rag/llm/retrieve_and_cache.py
+
+# Retriever experimental / old / training variants
+src/ere_rag/retriever/*old*.py
+src/ere_rag/retriever/*old2*.py
+src/ere_rag/retriever/*new*.py
+src/ere_rag/retriever/*cross*.py
+src/ere_rag/retriever/*mnrl*.py
+src/ere_rag/retriever/build_index_old*.py
+src/ere_rag/retriever/prepare_data_old*.py
+
+# ignore experiment outputs
+experiments/llm/
+experiments/retriever/
+
+
+
