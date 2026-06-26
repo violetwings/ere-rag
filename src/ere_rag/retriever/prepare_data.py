@@ -1,41 +1,58 @@
 """prepare_data.py
 
-Builds grouped training examples for S-BERT fine-tuning.
+Builds grouped training examples for S-BERT fine-tuning, for one of
+three categories selected via --category:
+    temporal  — positive pairs from MAVEN-ERE temporal relations.
+                Anchor set = event mentions + TIMEX (temporal Document).
+    causal    — positive pairs from MAVEN-ERE causal_relations
+                (CAUSE/PRECONDITION). Anchor set = event mentions ONLY —
+                no TIMEX.
+    both      — union of temporal and causal positive pairs. Anchor set
+                = the temporal Document's full event list (mentions +
+                TIMEX), since temporal relations need TIMEX. A TIMEX
+                anchor will simply never get a causal positive — causal
+                relations never reference TIMEX ids, so this is expected.
+
+Uses TWO Document classes ( existing ones, unmodified):
+    ere_rag.baselines.temporal.data.Document  — for temporal positives
+                                                  and the "both"/"temporal"
+                                                  anchor set (includes TIMEX)
+    ere_rag.baselines.causal.data.Document    — for causal positives
+                                                  (handles chain→mention
+                                                  expansion via its own
+                                                  eid2mentions/get_labels,
+                                                  no symmetric expansion,
+                                                  since CAUSE/PRECONDITION
+                                                  are directional)
 
 Output format — one JSON line per (anchor, positive) pair:
 {
-    "anchor":      str,          # anchor event sentence with <m> markers
-    "positive":    str,          # positive event sentence with <m> markers
-    "negatives":   [str, ...],   # all negatives assigned to this pair
-    "anchor_id":   str,
-    "positive_id": str,
-    "negative_ids": [str, ...],
-    "doc_id":      str,
-    "n_neg":       int           # len(negatives), stored for quick stats
+    "anchor":          str,
+    "positive":        str,
+    "negatives":       [str, ...],   # ALL negatives assigned to this pair
+                                      # (even distribution, unchanged)
+    "anchor_id":       str,
+    "positive_id":     str,
+    "negative_ids":    [str, ...],
+    "doc_id":          str,
+    "n_neg":           int,
+    "n_events_in_doc": int,           # kept for future use (e.g. percentage-
+                                       # based retrieval at inference time) —
+                                       
+    "category":        str            # "temporal" | "causal" | "both"
 }
 
-Negative distribution strategy — anchor-centric, nothing wasted:
-
-  For each anchor event e1:
-    positives = all events annotated as related to e1 (temporal or causal)
-    negatives = all events in the same document with NO annotation to e1
-
-    The total pool of negatives is divided across positives:
-      base      = n_neg // n_pos   negatives per positive (floor)
-      remainder = n_neg %  n_pos   extra negatives for the first R positives
-
-    Each (e1, e2) pair therefore gets a list of [base] or [base+1] negatives.
-    ALL negatives are used exactly once across that anchor's positives.
-
-  If n_neg < n_pos (rare), sample WITH replacement so every positive
-  still gets exactly one negative.
-
-  
+Negative distribution strategy — anchor-centric, nothing wasted (unchanged):
+for each anchor, ALL in-document negatives are evenly split across its
+positives so no negative is wasted. How many of those assigned negatives
+actually get sampled into training triplets is decided in
+train_retriever.py via --k_negatives 
 
 Usage:
     python src/ere_rag/retriever/prepare_data.py \
+        --category causal \
         --data_dir data/raw/MAVEN_ERE \
-        --output_dir data/interim \
+        --output_dir data/interim/causal \
         --sample_rate 0.15 \
         --seed 42
 """
@@ -43,19 +60,20 @@ Usage:
 import json
 import random
 import argparse
-from pathlib import Path
-from collections import defaultdict
 import sys
+from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[3]))
-from ere_rag.baselines.temporal.data import Document
+from ere_rag.baselines.temporal.data import Document as TemporalDocument
+from ere_rag.baselines.causal.data import Document as CausalDocument
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
-TEMPORAL_POSITIVE_IDS = {0, 1, 2, 3, 4, 5}
-CAUSAL_TYPES          = {"CAUSE", "PRECONDITION"}
-MARKER_OPEN           = "<m>"
-MARKER_CLOSE          = "</m>"
+TEMPORAL_POSITIVE_IDS = {0, 1, 2, 3, 4, 5}    # BEFORE..BEGINS-ON, excludes NONE=6
+CAUSAL_POSITIVE_IDS   = {0, 1}                 # CAUSE, PRECONDITION, excludes NONE=2
+MARKER_OPEN            = "<m>"
+MARKER_CLOSE           = "</m>"
+VALID_CATEGORIES       = ("temporal", "causal", "both")
 
 
 # ── Text helpers ───────────────────────────────────────────────────────────
@@ -63,7 +81,6 @@ MARKER_CLOSE          = "</m>"
 def wrap_event_in_sentence(document_data: dict, event: dict) -> str:
     """
     Reconstruct sentence from tokens[] and wrap the trigger word.
-    Uses tokens[] (guaranteed field) not sentences[] (may be absent).
     """
     sent_id  = event.get("sent_id", 0)
     tokens   = document_data.get("tokens", [])
@@ -77,31 +94,13 @@ def wrap_event_in_sentence(document_data: dict, event: dict) -> str:
     return f"{sentence} {MARKER_OPEN} {trigger} {MARKER_CLOSE}".strip()
 
 
-# ── Per-anchor map ─────────────────────────────────────────────────────────
+# ── Positive-pair extraction, per category ──────────────────────────────────
 
-def build_anchor_map(document_data: dict) -> dict[str, dict]:
-    """
-    For every event that has at least one annotated positive, build:
-        anchor_id -> {
-            "anchor":    event dict,
-            "positives": [event dict, ...],
-            "negatives": [event dict, ...],
-        }
-
-    Temporal relations come from Document.labels (includes TIMEX).
-    Causal relations come from causal_relations[], expanded chain→mention.
-    Both are pooled — retriever is binary.
-    """
-    doc    = Document(document_data, ignore_nonetype=False)
+def get_positive_pairs_temporal(doc: TemporalDocument) -> set[tuple[str, str]]:
+    """Same logic doc.get_labels() already uses, re-derived as an id-pair set."""
     events = doc.events
     n      = len(events)
-
-    if n < 2:
-        return {}
-
-    # Collect positive (e1_id, e2_id) pairs
     positive_pairs: set[tuple[str, str]] = set()
-
     label_idx = 0
     for i in range(n):
         for j in range(n):
@@ -109,17 +108,66 @@ def build_anchor_map(document_data: dict) -> dict[str, dict]:
                 if doc.labels[label_idx] in TEMPORAL_POSITIVE_IDS:
                     positive_pairs.add((events[i]["id"], events[j]["id"]))
                 label_idx += 1
+    return positive_pairs
 
-    for rel_type, pairs in document_data.get("causal_relations", {}).items():
-        if rel_type not in CAUSAL_TYPES:
-            continue
-        for pair in pairs:
-            for m1 in doc.eid2mentions.get(pair[0], [pair[0]]):
-                for m2 in doc.eid2mentions.get(pair[1], [pair[1]]):
-                    if m1 != m2:
-                        positive_pairs.add((m1, m2))
 
-    # Build per-anchor split
+def get_positive_pairs_causal(doc: CausalDocument) -> set[tuple[str, str]]:
+    """
+    Mirrors get_positive_pairs_temporal but against the causal Document's
+    own .events/.labels — these already reflect chain→mention expansion
+    (via eid2mentions in causal data.py's get_labels()).
+    """
+    events = doc.events
+    n      = len(events)
+    positive_pairs: set[tuple[str, str]] = set()
+    label_idx = 0
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                if doc.labels[label_idx] in CAUSAL_POSITIVE_IDS:
+                    positive_pairs.add((events[i]["id"], events[j]["id"]))
+                label_idx += 1
+    return positive_pairs
+
+
+# ── Per-anchor map ─────────────────────────────────────────────────────────
+
+def build_anchor_map(document_data: dict, category: str) -> tuple[dict[str, dict], int]:
+    """
+    For every event that has at least one annotated positive (under the
+    given category), build:
+        anchor_id -> {
+            "anchor":    event dict,
+            "positives": [event dict, ...],
+            "negatives": [event dict, ...],
+        }
+
+    Also returns n, the total number of events in the anchor set used
+    
+    """
+    if category == "causal":
+        c_doc  = CausalDocument(document_data, ignore_nonetype=False)
+        events = c_doc.events
+        n      = len(events)
+        if n < 2:
+            return {}, n
+        positive_pairs = get_positive_pairs_causal(c_doc)
+
+    else:
+        # "temporal" and "both" both anchor on the temporal Document's
+        # event set (includes TIMEX).
+        t_doc  = TemporalDocument(document_data, ignore_nonetype=False)
+        events = t_doc.events
+        n      = len(events)
+        if n < 2:
+            return {}, n
+        positive_pairs = get_positive_pairs_temporal(t_doc)
+
+        if category == "both":
+            c_doc = CausalDocument(document_data, ignore_nonetype=False)
+            if len(c_doc.events) >= 2:
+                positive_pairs = positive_pairs | get_positive_pairs_causal(c_doc)
+
     anchor_map: dict[str, dict] = {}
     for anchor in events:
         aid       = anchor["id"]
@@ -140,30 +188,22 @@ def build_anchor_map(document_data: dict) -> dict[str, dict]:
                 "negatives": negatives,
             }
 
-    return anchor_map
+    return anchor_map, n
 
 
-# ── Group construction ─────────────────────────────────────────────────────
+# ── Group construction ───────────────────────────────────────────────────────
 
 def build_groups_for_document(
-    document_data: dict,
-    anchor_map:    dict[str, dict],
-    rng:           random.Random,
+    document_data:   dict,
+    anchor_map:       dict[str, dict],
+    rng:              random.Random,
+    n_events_in_doc:  int,
+    category:         str,
 ) -> list[dict]:
     """
-    For each (anchor, positive) pair, produce one group dict containing
-    the pre-allocated slice of negatives for that pair.
-
-    Case A  n_neg >= n_pos:
-        Shuffle negatives. Distribute evenly:
-          base      = n_neg // n_pos
-          remainder = n_neg %  n_pos
-        Positive i gets (base + 1) negatives if i < remainder, else base.
-        All negatives used exactly once across the anchor's positives.
-
-    Case B  n_neg < n_pos:
-        Each positive gets exactly one negative sampled with replacement.
-        Every positive still produces a group.
+    Case A  n_neg >= n_pos: distribute all negatives evenly across positives.
+    Case B  n_neg < n_pos: sample with replacement, one negative per positive.
+    (Unchanged — category-agnostic, just tags the result.)
     """
     doc_id = document_data["id"]
     groups = []
@@ -182,7 +222,6 @@ def build_groups_for_document(
         anchor_text = wrap_event_in_sentence(document_data, anchor)
 
         if n_neg >= n_pos:
-            # Case A — distribute all negatives evenly, nothing wasted
             neg_shuffled = negatives[:]
             rng.shuffle(neg_shuffled)
 
@@ -196,30 +235,33 @@ def build_groups_for_document(
                 cursor     += n_for_this
 
                 groups.append({
-                    "anchor":       anchor_text,
-                    "positive":     wrap_event_in_sentence(document_data, positive),
-                    "negatives":    [wrap_event_in_sentence(document_data, ne)
-                                     for ne in assigned],
-                    "anchor_id":    aid,
-                    "positive_id":  positive["id"],
-                    "negative_ids": [ne["id"] for ne in assigned],
-                    "doc_id":       doc_id,
-                    "n_neg":        n_for_this,
+                    "anchor":          anchor_text,
+                    "positive":        wrap_event_in_sentence(document_data, positive),
+                    "negatives":       [wrap_event_in_sentence(document_data, ne)
+                                        for ne in assigned],
+                    "anchor_id":       aid,
+                    "positive_id":     positive["id"],
+                    "negative_ids":    [ne["id"] for ne in assigned],
+                    "doc_id":          doc_id,
+                    "n_neg":           n_for_this,
+                    "n_events_in_doc": n_events_in_doc,
+                    "category":        category,
                 })
 
         else:
-            # Case B — sample with replacement, one negative per positive
             for positive in positives:
                 neg_event = rng.choice(negatives)
                 groups.append({
-                    "anchor":       anchor_text,
-                    "positive":     wrap_event_in_sentence(document_data, positive),
-                    "negatives":    [wrap_event_in_sentence(document_data, neg_event)],
-                    "anchor_id":    aid,
-                    "positive_id":  positive["id"],
-                    "negative_ids": [neg_event["id"]],
-                    "doc_id":       doc_id,
-                    "n_neg":        1,
+                    "anchor":          anchor_text,
+                    "positive":        wrap_event_in_sentence(document_data, positive),
+                    "negatives":       [wrap_event_in_sentence(document_data, neg_event)],
+                    "anchor_id":       aid,
+                    "positive_id":     positive["id"],
+                    "negative_ids":    [neg_event["id"]],
+                    "doc_id":          doc_id,
+                    "n_neg":           1,
+                    "n_events_in_doc": n_events_in_doc,
+                    "category":        category,
                 })
 
     return groups
@@ -280,19 +322,29 @@ def main():
     parser = argparse.ArgumentParser(
         description="Build grouped training examples for S-BERT retriever"
     )
+    parser.add_argument(
+        "--category", type=str, required=True, choices=VALID_CATEGORIES,
+        help="Which relation type(s) to build positive pairs from."
+    )
     parser.add_argument("--data_dir",   type=str, default="data/raw/MAVEN_ERE")
-    parser.add_argument("--output_dir", type=str, default="data/interim")
+    parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument(
         "--sample_rate", type=float, default=0.15,
         help="Fraction of train documents to use (valid always uses all)"
     )
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Data-prep seed — keep this fixed (42) across all runs of a "
+             "given category. Only train_retriever.py's --seed should vary."
+    )
     args = parser.parse_args()
 
     rng        = random.Random(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     stats      = {}
+
+    print(f"Category: {args.category}")
 
     for split in ["train", "valid"]:
         print(f"\nProcessing {split} split...")
@@ -310,7 +362,7 @@ def main():
 
         for doc_data in documents:
             try:
-                anchor_map = build_anchor_map(doc_data)
+                anchor_map, n_events_in_doc = build_anchor_map(doc_data, args.category)
             except Exception as e:
                 print(f"  Warning: skipped {doc_data.get('id','?')} — {e}")
                 n_skipped += 1
@@ -321,13 +373,13 @@ def main():
                 continue
 
             all_groups.extend(
-                build_groups_for_document(doc_data, anchor_map, rng)
+                build_groups_for_document(doc_data, anchor_map, rng, n_events_in_doc, args.category)
             )
 
         if n_skipped:
             print(f"  Skipped {n_skipped} documents (no annotated positives)")
 
-        print_stats(all_groups, split)
+        print_stats(all_groups, f"{split}/{args.category}")
         save_groups(all_groups, output_dir / f"{split}_groups.jsonl")
 
         stats[split] = {
@@ -340,11 +392,6 @@ def main():
     with open(output_dir / "group_stats.json", "w") as f:
         json.dump(stats, f, indent=2)
     print(f"\nStats → {output_dir / 'group_stats.json'}")
-    print(
-        "\nEach line = one (anchor, positive, [negatives]) group.\n"
-        "train_retriever.py samples --max_groups of these, then draws\n"
-        "one negative per group randomly each epoch."
-    )
 
 
 if __name__ == "__main__":

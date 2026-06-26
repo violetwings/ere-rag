@@ -1,26 +1,35 @@
 """
 build_index.py
 
-Encodes all event mentions in the VALIDATION split using the
-fine-tuned S-BERT model and evaluates retriever recall@k for RQ1.
+Encodes all event mentions for one category (temporal/causal/both) using
+the fine-tuned S-BERT model and evaluates retriever recall@P% for RQ1,
+where P% is a PERCENTAGE OF A DOCUMENT'S OTHER EVENTS rather than a fixed
+k — so the retrieval budget scales with document size instead of being a
+flat count that's too small for big documents and too large for small ones.
+
+For a document with n total candidate mentions, percentage p retrieves:
+    pct_k = max(1, round(p * (n - 1)))
+
 
 Performance design:
   - All mentions in a document are encoded in ONE batched model.encode()
     call. The resulting embedding matrix is stored and reused for both
     index construction and all query lookups.
-  - FAISS search runs ONCE per query at max(k_values) and results are
-    sliced for smaller k — eliminates redundant searches.
+  - FAISS search runs ONCE per query
+    per percentage — eliminates redundant searches.
   - No per-query model.encode() calls inside any loop.
-
-With 710 validation documents on Apple M1 this takes ~3-5 minutes
-instead of the previous 45-60 minutes.
+  - Cache (top-100% per query) , so
+    pipeline.py's downstream loading is untouched — only the RQ1
+    EVALUATION cutoff is percentage-based, not the cache depth.
 
 Usage:
     python src/ere_rag/retriever/build_index.py \
-        --output_dir experiments/retriever/<run_name> \
+        --category temporal \
+        --output_dir experiments/retriever/temporal/<run_name> \
         --processed_dir data/processed \
-        --k_values 5 10 20 30 50
+        --percentages 5 10 20 30 50 60
 """
+
 
 import json
 import argparse
@@ -49,6 +58,14 @@ def get_device() -> str:
 MARKER_OPEN  = "<m>"
 MARKER_CLOSE = "</m>"
 
+TEMPORAL_RELATIONS = [
+    "BEFORE", "OVERLAP", "CONTAINS",
+    "SIMULTANEOUS", "ENDS-ON", "BEGINS-ON"
+]
+CAUSAL_RELATIONS = ["CAUSE", "PRECONDITION"]
+
+NEGATIVE_LABEL  = "NOREL"
+VALID_CATEGORIES = ("temporal", "causal", "both")
 
 # ── Text helpers ────────────────────────────────────────────────────────────
 
@@ -70,6 +87,32 @@ def load_jsonl(filepath: Path) -> list[dict]:
     return data
 
 
+def load_pairs_for_category(processed_dir: Path, split: str, category: str) -> list[dict]:
+    """
+    temporal/causal: load that category's own pairs file.
+    both: load AND MERGE both files — safe because positivity is decided
+    per-row by is_positive_label(), not by which file the row came from.
+    """
+    if category in ("temporal", "causal"):
+        path = processed_dir / f"{split}_{category}_pairs.jsonl"
+        return load_jsonl(path)
+    if category == "both":
+        t_path = processed_dir / f"{split}_temporal_pairs.jsonl"
+        c_path = processed_dir / f"{split}_causal_pairs.jsonl"
+        return load_jsonl(t_path) + load_jsonl(c_path)
+    raise ValueError(f"Unknown category: {category!r}")
+
+
+def is_positive_label(label: str, category: str) -> bool:
+    if category == "temporal":
+        return label in TEMPORAL_RELATIONS
+    if category == "causal":
+        return label in CAUSAL_RELATIONS
+    if category == "both":
+        return label in TEMPORAL_RELATIONS or label in CAUSAL_RELATIONS
+    raise ValueError(f"Unknown category: {category!r}")
+
+
 # ── Metrics ─────────────────────────────────────────────────────────────────
 
 def prf(tp: int, retrieved: int, relevant: int) -> tuple[float, float, float]:
@@ -82,99 +125,92 @@ def prf(tp: int, retrieved: int, relevant: int) -> tuple[float, float, float]:
 # ── Per-document evaluation ──────────────────────────────────────────────────
 
 def evaluate_document(
-    mentions:    list[dict],          # all unique mentions in the document
-    embeddings:  np.ndarray,          # shape (n_mentions, dim), already normalised
-    gt:          dict[str, set],      # head_id -> set of tail_ids
-    gt_cat:      dict[str, str],      # head_id -> "temporal" or "causal"
-    mention_idx: dict[str, int],      # mention_id -> position in mentions list
-    k_values:    list[int],
-    max_k:       int,
-) -> tuple[dict, dict, dict]:
+    mentions:    list[dict],
+    embeddings:  np.ndarray,
+    gt:          dict[str, set],
+    gt_cat:      dict[str, str],
+    mention_idx: dict[str, int],
+    percentages: list[float],
+) -> tuple[dict, dict, dict, int]:
     """
-    Evaluate one document using pre-computed embeddings.
+    Evaluate one document using pre-computed embeddings, at each
+    percentage cutoff (relative to n-1, this document's OTHER events).
 
-    Runs FAISS search once per query at max_k, then slices for all k values.
-    No model.encode() calls here — embeddings are passed in from the batch.
+    Runs FAISS search once per query
+    percentage — no extra search needed per percentage.
 
-    Returns accumulators for overall, temporal, causal — each a dict
-    keyed by k with {"tp", "retrieved", "total"}.
+    Returns accumulators for overall, temporal, causal (each keyed by
+    the float percentage, e.g. 0.2), plus the number of queries
+    evaluated in this document (for the avg-retrieved diagnostic).
     """
     n = len(mentions)
     if n < 2:
-        return {}, {}, {}
+        return {}, {}, {}, 0
 
-    # Build flat inner-product index from pre-computed embeddings
     dim   = embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
 
-    acc          = {k: {"tp": 0, "retrieved": 0, "total": 0} for k in k_values}
-    acc_temporal = {k: {"tp": 0, "retrieved": 0, "total": 0} for k in k_values}
-    acc_causal   = {k: {"tp": 0, "retrieved": 0, "total": 0} for k in k_values}
+    acc          = {p: {"tp": 0, "retrieved": 0, "total": 0} for p in percentages}
+    n_queries    = 0
 
     for hid, true_tails in gt.items():
         q_idx = mention_idx.get(hid)
         if q_idx is None:
             continue
+        n_queries += 1
 
-        query_emb = embeddings[q_idx : q_idx + 1]   # shape (1, dim), already normalised
+        query_emb = embeddings[q_idx : q_idx + 1]
         cat       = gt_cat.get(hid, "temporal")
 
-        # Single FAISS search at max_k — reuse results for all k values
-        search_k       = min(max_k + 1, n)
-        _, raw_indices = index.search(query_emb, search_k)
+        
+        _, raw_indices = index.search(query_emb, n)
 
-        # Build ordered list of retrieved IDs excluding the query itself
         retrieved_all: list[str] = []
         for idx in raw_indices[0]:
             cand_id = mentions[idx]["head_mention_id"]
             if cand_id != hid:
                 retrieved_all.append(cand_id)
-            if len(retrieved_all) >= max_k:
-                break
+            
 
-        # Slice for each k — no extra search needed
-        for k in k_values:
-            retrieved_ids = set(retrieved_all[:k])
+        for pct in percentages:
+            # Cutoff relative to n-1 (this doc's other events)
+            pct_k = max(1, round(pct * (n - 1)))
+            pct_k = min(pct_k, len(retrieved_all))
+            retrieved_ids = set(retrieved_all[:pct_k])
             tp = len(true_tails & retrieved_ids)
 
-            acc[k]["tp"]        += tp
-            acc[k]["retrieved"] += len(retrieved_ids)
-            acc[k]["total"]     += len(true_tails)
+            acc[pct]["tp"]        += tp
+            acc[pct]["retrieved"] += len(retrieved_ids)
+            acc[pct]["total"]     += len(true_tails)
 
-            target = acc_temporal if cat == "temporal" else acc_causal
-            target[k]["tp"]        += tp
-            target[k]["retrieved"] += len(retrieved_ids)
-            target[k]["total"]     += len(true_tails)
 
-    return acc, acc_temporal, acc_causal
+    return acc, n_queries
 
 
 # ── Main evaluation loop ─────────────────────────────────────────────────────
 
 def evaluate(
-    pairs:     list[dict],
-    model:     SentenceTransformer,
-    k_values:  list[int],
+    pairs:      list[dict],
+    category:   str,
+    model:      SentenceTransformer,
+    percentages: list[float],
     output_dir: Path,
     batch_size: int = 256,
 ) -> dict:
     """
-    Evaluate retriever recall@k across all documents.
+    Evaluate retriever recall@P% across all documents.
 
-    Key optimisation: for each document, encode ALL mentions in one
-    batched model.encode() call, store the embedding matrix, then do
-    all query lookups using row-slices of that matrix — zero extra
-    encode calls inside the per-query loop.
+    Same per-document batched-encode optimisation as before — only the
+    evaluation cutoff (percentage vs fixed k) and the category-aware
+    positive filtering are new.
     """
-    # ← CREATE output_dir FIRST
     indices_dir = output_dir / "indices"
     indices_dir.mkdir(parents=True, exist_ok=True)
 
     cache_dir = output_dir / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    
-    max_k = 100  # Cache always stores top-100 regardless of k_values so the cache can be reused for different k without re-running
+
 
     # ── Group pairs by document ────────────────────────────────────────
     doc_positives: dict[str, list[dict]] = defaultdict(list)
@@ -182,7 +218,7 @@ def evaluate(
 
     for pair in pairs:
         doc_id = pair["doc_id"]
-        if pair["label"] != "NOREL":
+        if is_positive_label(pair["label"], category):
             doc_positives[doc_id].append(pair)
 
         for mid, trig, sent in [
@@ -196,13 +232,12 @@ def evaluate(
                     "head_sentence":   pair[sent],
                 }
 
-    doc_ids = list(doc_positives.keys())
-    print(f"\nEvaluating on {len(doc_ids)} documents...")
+    doc_ids = list(doc_mentions.keys())
+    print(f"\nEvaluating on {len(doc_ids)} documents (category={category})...")
 
     # ── Global accumulators ────────────────────────────────────────────
-    total_acc  = {k: {"tp": 0, "retrieved": 0, "total": 0} for k in k_values}
-    total_temp = {k: {"tp": 0, "retrieved": 0, "total": 0} for k in k_values}
-    total_caus = {k: {"tp": 0, "retrieved": 0, "total": 0} for k in k_values}
+    total_acc    = {p: {"tp": 0, "retrieved": 0, "total": 0} for p in percentages}
+    total_queries = 0
 
     for doc_id in tqdm(doc_ids, desc="Documents"):
         mentions_dict = doc_mentions[doc_id]
@@ -224,72 +259,66 @@ def evaluate(
             show_progress_bar=False,
         ).astype("float32")
 
-        # Map mention_id -> index in mentions_list (and embeddings)
         mention_idx = {
             m["head_mention_id"]: i
             for i, m in enumerate(mentions_list)
         }
 
-        # Build ground truth for this document
+      
         gt:     dict[str, set] = defaultdict(set)
         gt_cat: dict[str, str] = {}
         for pair in doc_positives[doc_id]:
             hid = pair["head_mention_id"]
             tid = pair["tail_mention_id"]
             gt[hid].add(tid)
-            gt_cat[hid] = pair.get("relation_category", "temporal")
+            gt_cat[hid] = pair.get("relation_category", "temporal") if category == "both" else category
 
         # ── Evaluate using pre-computed embeddings ─────────────────────
-        acc, acc_t, acc_c = evaluate_document(
+        acc, n_q = evaluate_document(
             mentions_list, embeddings, gt, gt_cat, mention_idx,
-            k_values, max_k,
+            percentages,
         )
+        total_queries += n_q
 
         # ── Merge into global accumulators ─────────────────────────────
-        for k in k_values:
+        for p in percentages:
             for key in ("tp", "retrieved", "total"):
-                total_acc[k][key]  += acc.get(k, {}).get(key, 0)
-                total_temp[k][key] += acc_t.get(k, {}).get(key, 0)
-                total_caus[k][key] += acc_c.get(k, {}).get(key, 0)
+                total_acc[p][key] += acc.get(p, {}).get(key, 0)
 
-        # ← BUILD INDEX for saving + caching
+        # ── Build index for saving + caching (unchanged) ───────────────
         dim = embeddings.shape[1]
         index = faiss.IndexFlatIP(dim)
         index.add(embeddings)
 
-        # Save embeddings for later use (avoid re-encoding)
         embeddings_path = indices_dir / f"{doc_id}_embeddings.npy"
         np.save(str(embeddings_path), embeddings)
 
-        # Save index + mentions
         index_path = indices_dir / f"{doc_id}.faiss"
         faiss.write_index(index, str(index_path))
 
         mentions_path = indices_dir / f"{doc_id}_mentions.pkl"
-        
         with open(mentions_path, "wb") as f:
             pickle.dump(mentions_list, f)
-        
-        # ← NEW: Build cache while we have embeddings
+
+        # ── Cache (top-100% per query) ──────
         cache_dict = {}
         for q_idx, query_mention in enumerate(mentions_list):
-            query_id = query_mention["head_mention_id"]
+            query_id  = query_mention["head_mention_id"]
             query_emb = embeddings[q_idx : q_idx + 1]
-            
-            # Search for top-100
-            _, top_indices = index.search(query_emb, min(100, len(mentions_list)))
-            
+
+            _, top_indices = index.search(query_emb, len(mentions_list))
+
             wrapped_candidates = []
             for candidate_idx in top_indices[0]:
                 candidate = mentions_list[candidate_idx]
                 if candidate["head_mention_id"] == query_id:
-                    continue  # skip self
+                    continue
                 sentence = candidate["head_sentence"]
-                trigger = candidate["head_trigger"]
-                wrapped_sentence = wrap_trigger(sentence, trigger)  # use wrap_trigger for consistent spacing
+                trigger  = candidate["head_trigger"]
+                wrapped_sentence = wrap_trigger(sentence, trigger)
                 wrapped_candidates.append({
-                    "id": candidate["head_mention_id"],
-                    "trigger": trigger,
+                    "id":               candidate["head_mention_id"],
+                    "trigger":          trigger,
                     "wrapped_sentence": wrapped_sentence,
                 })
             cache_dict[query_id] = {
@@ -297,22 +326,24 @@ def evaluate(
                 "query_sentence": wrap_trigger(query_mention["head_sentence"], query_mention["head_trigger"]),
                 "candidates":     wrapped_candidates,
             }
-        
-        # Save cache
+
         cache_path = cache_dir / f"{doc_id}_cache.json"
         with open(cache_path, "w") as f:
             json.dump(cache_dict, f, indent=2)
 
     # ── Compute scores ─────────────────────────────────────────────────
     scores = {}
-    for k in k_values:
-        p,  r,  f  = prf(total_acc[k]["tp"],  total_acc[k]["retrieved"],  total_acc[k]["total"])
-        tp, tr, tf = prf(total_temp[k]["tp"], total_temp[k]["retrieved"], total_temp[k]["total"])
-        cp, cr, cf = prf(total_caus[k]["tp"], total_caus[k]["retrieved"], total_caus[k]["total"])
-        scores[f"@{k}"] = {
-            "precision": p,  "recall": r,  "f1": f,
-            "temporal":  {"precision": tp, "recall": tr, "f1": tf},
-            "causal":    {"precision": cp, "recall": cr, "f1": cf},
+    for p in percentages:
+        prec, rec, f1 = prf(
+            total_acc[p]["tp"], total_acc[p]["retrieved"], total_acc[p]["total"]
+        )
+        avg_retrieved = total_acc[p]["retrieved"] / max(1, total_queries)
+        label = f"{round(p*100)}%"
+        scores[label] = {
+            "precision":     prec,
+            "recall":        rec,
+            "f1":            f1,
+            "avg_retrieved": round(avg_retrieved, 1),
         }
 
     return scores
@@ -322,80 +353,82 @@ def evaluate(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build FAISS index and evaluate recall@k for RQ1"
+        description="Build FAISS index and evaluate recall@P% for RQ1"
+    )
+    parser.add_argument(
+        "--category", type=str, required=True, choices=VALID_CATEGORIES,
+        help="Which relation type(s) to evaluate against."
     )
     parser.add_argument("--processed_dir", type=Path, default="data/processed",
                         help="Path to processed pairs")
-    parser.add_argument("--output_dir",    type=Path, default="experiments/retriever",
-                        help="Path to save FAISS indices, embeddings, and results")
-    parser.add_argument("--split", type=str, default="valid",  # ← ADD THIS
+    parser.add_argument("--output_dir",    type=Path, required=True,
+                        help="Run folder containing model/ — also where "
+                             "indices/, cache/, and rq1_results.json go")
+    parser.add_argument("--split", type=str, default="valid",
                         help="Data split (train/valid/test)")
-    parser.add_argument("--k_values",      type=int, nargs="+",
-                        default=[5, 10, 20, 30, 50])
+    parser.add_argument(
+        "--percentages", type=int, nargs="+", default=[10, 20, 30, 50],
+        help="Retrieval cutoffs as percentages of a document's OTHER "
+             "events (n-1), e.g. '10 20 30 50' means 10%%, 20%%, 30%%, "
+             "50%%. Defaults bracket the ~0.25 average relation density "
+    )
     parser.add_argument("--batch_size",    type=int, default=256,
                         help="Sentences per model.encode() batch. "
                              "256 is fast on MPS/CPU; raise to 512 on GPU.")
     args = parser.parse_args()
 
+    percentages = [p / 100 for p in args.percentages]
+
     device = get_device()
     print(f"Device: {device}")
 
-    # Expects the model to be saved at <output_dir>/model/ by train_retriever.py
     model_path = args.output_dir / "model"
-    #model_path = Path(model_path)
     print(f"Loading model: {model_path}")
     model = SentenceTransformer(str(model_path), device=device)
 
     wem = model._first_module()
     wem.tokenizer.add_tokens([MARKER_OPEN, MARKER_CLOSE], special_tokens=True)
-    # Do NOT resize embeddings here — saved model already has correct vocab size.
     
-    print("Loading validation pairs...")
-    all_pairs = load_jsonl(Path(args.processed_dir) / f"{args.split}_pairs.jsonl")
-    n_pos = sum(1 for p in all_pairs if p["label"] != "NOREL")
-    print(f"  {len(all_pairs):,} pairs  |  positive: {n_pos:,}  |  NOREL: {len(all_pairs)-n_pos:,}")
+
+    print(f"Loading {args.split} pairs for category={args.category}...")
+    all_pairs = load_pairs_for_category(args.processed_dir, args.split, args.category)
+    n_pos = sum(1 for p in all_pairs if is_positive_label(p["label"], args.category))
+    print(f"  {len(all_pairs):,} pairs  |  positive: {n_pos:,}  |  other: {len(all_pairs)-n_pos:,}")
 
     start  = time.time()
     scores = evaluate(
-        all_pairs, 
-        model, 
-        args.k_values,
+        all_pairs,
+        args.category,
+        model,
+        percentages,
         output_dir=args.output_dir,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
     )
     elapsed = time.time() - start
 
     # ── Print results ──────────────────────────────────────────────────
-    print("\n=== RQ1 RESULTS ===")
-    print(f"{'k':>5}  {'P':>7}  {'R':>7}  {'F1':>7}  "
-          f"{'T-P':>7}  {'T-R':>7}  {'T-F1':>7}  "
-          f"{'C-P':>7}  {'C-R':>7}  {'C-F1':>7}")
+    print(f"\n=== RQ1 RESULTS (category={args.category}) ===")
+    print(f"{'%':>5}  {'P':>7}  {'R':>7}  {'F1':>7}  {'avg_k':>7}")
     print("-" * 85)
-    for k in args.k_values:
-        s = scores[f"@{k}"]
-        t = s["temporal"]
-        c = s["causal"]
-        print(f"@{k:>4}  {s['precision']:>7.4f}  {s['recall']:>7.4f}  {s['f1']:>7.4f}  "
-              f"{t['precision']:>7.4f}  {t['recall']:>7.4f}  {t['f1']:>7.4f}  "
-              f"{c['precision']:>7.4f}  {c['recall']:>7.4f}  {c['f1']:>7.4f}")
+    for p in args.percentages:
+        label = f"{p}%"
+        s = scores[label]
+        print(f"{label:>5}  {s['precision']:>7.4f}  {s['recall']:>7.4f}  "
+              f"{s['f1']:>7.4f}  {s['avg_retrieved']:>7.1f}")
 
-    print(f"\nEvaluation time: {elapsed:.1f}s  "
-          f"({elapsed/60:.1f} min)")
+    print(f"\nEvaluation time: {elapsed:.1f}s  ({elapsed/60:.1f} min)")
 
     # ── Save ──────────────────────────────────────────────────────────
     out_path = Path(args.output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)  # ← This creates the dir
-    
+    out_path.mkdir(parents=True, exist_ok=True)
+
     with open(out_path / "rq1_results.json", "w") as f:
         json.dump({
-            "model_path": str(model_path),
-            "k_values":   args.k_values,
-            "scores":     scores,
-            "time_sec":   round(elapsed, 1),
-            "note": (
-                "Retriever is BINARY. temporal/causal split shows "
-                "coverage by relation type, not model predictions."
-            ),
+            "category":    args.category,
+            "model_path":  str(model_path),
+            "percentages": args.percentages,
+            "scores":      scores,
+            "time_sec":    round(elapsed, 1),
         }, f, indent=2)
     print(f"Results → {out_path / 'rq1_results.json'}")
 

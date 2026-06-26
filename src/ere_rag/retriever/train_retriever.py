@@ -2,27 +2,28 @@
 train_retriever.py
 
 Fine-tunes S-BERT on MAVEN-ERE event relation groups using TripletLoss.
+Supports --category {temporal, causal, both}.
 
 Reads the grouped format produced by prepare_data.py:
-    { "anchor": str, "positive": str, "negatives": [str, ...], ... }
+    { "anchor": str, "positive": str, "negatives": [str, ...],
+      "doc_id": str, "category": str, ... }
 
-At each epoch, ONE negative is sampled at random from each group's
-negatives list. This means:
-  - The same (anchor, positive) pair sees a different negative each epoch
-  - Over 5 epochs, the model explores up to 5 distinct negatives per pair
-  - No negative is wasted or over-committed at data-prep time
+NEGATIVE SAMPLING:
+    k = min(k_negatives, len(group["negatives"]))
+    negatives = sample(group["negatives"], k)  
 
-Sampling (--max_groups):
-  Groups are sampled proportionally per document so no single document
-  dominates. The negative diversity is already baked in by prepare_data.py's
-  even distribution — sampling groups preserves that structure.
 
-Usage:
+Usage (temporal):
     python src/ere_rag/retriever/train_retriever.py \
-        --max_groups 20000 \
-        --epochs 1 \
+        --category causal \
+        --interim_dir data/interim/causal \
+        --experiments_dir experiments/retriever \
+        --k_negatives 5 \
+        --max_groups 5000 \
+        --epochs 5 \
         --batch_size 16 \
-        --device mps
+        --device cpu \
+        --seed 1
 """
 
 import json
@@ -60,7 +61,8 @@ def get_device(device_name: str) -> str:
     return "cpu"
 
 
-MARKER_TOKENS = ["<m>", "</m>"]
+MARKER_TOKENS     = ["<m>", "</m>"]
+VALID_CATEGORIES  = ("temporal", "causal", "both")
 
 
 # ── Data loading ───────────────────────────────────────────────────────────
@@ -80,7 +82,7 @@ def load_groups(filepath: Path) -> list[dict]:
 def sample_groups(
     groups:     list[dict],
     max_groups: int | None,
-    seed:       int,
+    seed:       int
 ) -> list[dict]:
     """
     Sample up to max_groups, proportional per document so no single
@@ -118,31 +120,31 @@ def sample_groups(
     return sampled
 
 
-# ── Per-epoch Dataset ──────────────────────────────────────────────────────
+# ── Dataset — negatives fixed once, not resampled per epoch ────────────────
 
 class GroupDataset(Dataset):
     """
-    Each call to __getitem__ samples ONE negative at random from the
-    group's negatives list. This means every epoch sees a different
-    set of (anchor, positive, negative) triplets for the same groups,
-    giving the model broader negative exposure without any extra storage.
+    Samples k_negatives once per group, at construction time, using the
+    run's --seed. 
     """
 
-    def __init__(self, groups: list[dict], seed: int):
-        self.groups = groups
-        self.rng    = random.Random(seed)
-
-    def reseed(self, epoch: int) -> None:
-        """Call before each epoch to get different negatives per epoch."""
-        self.rng = random.Random(epoch * 9999 + 42)
+    def __init__(self, groups: list[dict], seed: int, k_negatives: int = 3):
+        self.k_negatives = k_negatives
+        rng = random.Random(seed)
+        self.fixed_examples: list[list[InputExample]] = []
+        for g in groups:
+            k    = min(k_negatives, len(g["negatives"]))
+            negs = rng.sample(g["negatives"], k=k)
+            self.fixed_examples.append([
+                InputExample(texts=[g["anchor"], g["positive"], neg])
+                for neg in negs
+            ])
 
     def __len__(self) -> int:
-        return len(self.groups)
+        return len(self.fixed_examples)
 
-    def __getitem__(self, idx: int) -> InputExample:
-        g       = self.groups[idx]
-        neg     = self.rng.choice(g["negatives"])
-        return InputExample(texts=[g["anchor"], g["positive"], neg])
+    def __getitem__(self, idx: int) -> list[InputExample]:
+        return self.fixed_examples[idx]
 
 
 # ── Evaluator ──────────────────────────────────────────────────────────────
@@ -157,11 +159,7 @@ def build_evaluator(
     For evaluation, fix one negative per group (first in list) so the
     metric is comparable across epochs. We use the first neg rather than
     random so the evaluator is deterministic.
-
-    Expected accuracy range with hard in-document negatives: 0.70–0.85.
-    Above 0.95 → negatives too easy. Below 0.60 → marker/label issue.
     """
-    rng    = random.Random(seed)
     subset = valid_groups[:max_eval]
     return evaluation.TripletEvaluator(
         anchors=[g["anchor"]              for g in subset],
@@ -177,13 +175,18 @@ def main():
     parser = argparse.ArgumentParser(
         description="Fine-tune S-BERT with grouped negatives + TripletLoss"
     )
-    parser.add_argument("--interim_dir",     type=str, default="data/interim")
+    parser.add_argument(
+        "--category", type=str, required=True, choices=VALID_CATEGORIES,
+        help="Used only for run-folder naming / config bookkeeping — "
+             "--interim_dir controls which data actually gets loaded."
+    )
+    parser.add_argument("--interim_dir",     type=str, required=True)
     parser.add_argument("--experiments_dir", type=str, default="experiments/retriever")
     parser.add_argument("--base_model",      type=str, default="all-MiniLM-L6-v2")
     parser.add_argument("--epochs",          type=int, default=5)
     parser.add_argument(
         "--batch_size", type=int, default=16,
-        help="16 works well on MPS. Reduce to 8 if OOM."
+        help="16 works well on MPS/CPU. Reduce to 8 if OOM."
     )
     parser.add_argument("--warmup_steps",    type=int, default=100)
     parser.add_argument("--seed",            type=int, default=42)
@@ -192,29 +195,38 @@ def main():
         choices=["cpu", "mps", "cuda"]
     )
     parser.add_argument(
-        "--max_groups", type=int, default=20000,
-        help="Max groups to train on per run. Each epoch re-samples negatives."
+        "--max_groups", type=int, default=None,
+        help="Max groups to train on per run."
+    )
+    parser.add_argument(
+        "--k_negatives", type=int, default=3,
+        help="Negatives sampled per group, fixed once at construction "
+             "(seeded by --seed), reused for every epoch."
     )
     args = parser.parse_args()
 
     # ── Output dir ─────────────────────────────────────────────────────
+    mg = args.max_groups if args.max_groups is not None else "ALL"
+
     run_name = (
-        f"grouped"
+        f"grouped_{args.category}"
+        f"_k{args.k_negatives}"
         f"_seed{args.seed}"
         f"_ep{args.epochs}"
         f"_bs{args.batch_size}"
-        f"_mg{args.max_groups}"
+        f"_mg{mg}"
         f"_{args.device}"
     )
-    output_dir = Path(args.experiments_dir) / run_name
+    output_dir = Path(args.experiments_dir) / args.category / run_name
     model_dir  = output_dir / "model"
-    eval_dir = model_dir / "eval"
+    eval_dir   = model_dir / "eval"
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir.mkdir(parents=True, exist_ok=True)
     eval_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Run:    {run_name}")
-    print(f"Output: {output_dir}")
+    print(f"Category: {args.category}")
+    print(f"Run:      {run_name}")
+    print(f"Output:   {output_dir}")
 
     # ── Load groups ────────────────────────────────────────────────────
     print("\nLoading groups...")
@@ -223,7 +235,7 @@ def main():
     print(f"  Train: {len(train_groups):,}  |  Valid: {len(valid_groups):,}")
 
     avg_neg = sum(g["n_neg"] for g in train_groups) / max(1, len(train_groups))
-    print(f"  Avg negatives per group (train): {avg_neg:.1f}")
+    print(f"  Avg negatives ASSIGNED per group (from prepare_data.py): {avg_neg:.1f}")
 
     # ── Sample groups ──────────────────────────────────────────────────
     print(f"\nSampling to max_groups={args.max_groups}...")
@@ -234,7 +246,13 @@ def main():
           f"| avg groups/doc: {len(train_groups)/max(1,n_docs):.1f}")
 
     # ── Dataset + model ────────────────────────────────────────────────
-    dataset = GroupDataset(train_groups, seed=args.seed)
+    dataset = GroupDataset(train_groups, seed=args.seed, k_negatives=args.k_negatives)
+
+    actual_k = [len(ex) for ex in dataset.fixed_examples]
+    print(
+        f"\nNegatives per group (k_negatives={args.k_negatives}): "
+        f"min={min(actual_k)}  max={max(actual_k)}  avg={sum(actual_k)/len(actual_k):.1f}"
+    )
 
     device = get_device(args.device)
     print(f"\nLoading '{args.base_model}' on {device}...")
@@ -256,27 +274,23 @@ def main():
     # ── Evaluator ──────────────────────────────────────────────────────
     evaluator = build_evaluator(valid_groups, seed=args.seed, max_eval=300)
 
-    # ── Manual training loop (needed for per-epoch negative resampling) ─
-    # We can't use model.fit() here because we need to call dataset.reseed()
-    # before each epoch's DataLoader is created. Instead we replicate
-    # model.fit()'s core logic manually.
+    # ── Manual training loop ────────────────────────────────────────────
+
 
     from torch.optim import AdamW
     from transformers import get_linear_schedule_with_warmup
 
     steps_per_epoch = len(train_groups) // args.batch_size
     total_steps     = steps_per_epoch * args.epochs
-    est_min         = (total_steps * 1.5) / 60
+   
 
-    print(f"\nTraining with per-epoch negative resampling...")
+    print(f"\nTraining (negatives fixed once — same triplets every epoch)...")
     print(f"  Loss:             TripletLoss (cosine, margin=0.5)")
     print(f"  Epochs:           {args.epochs}")
     print(f"  Groups/epoch:     {len(train_groups):,}")
     print(f"  Batch size:       {args.batch_size}")
     print(f"  Steps/epoch:      {steps_per_epoch}  |  Total: {total_steps}")
-    print(f"  Est. time:        ~{est_min:.0f} min on M1")
-    print(f"  Negative variety: up to {args.epochs} distinct negatives "
-          f"per (anchor, positive) pair across epochs")
+    
 
     optimizer = AdamW(model.parameters(), lr=2e-5)
     scheduler = get_linear_schedule_with_warmup(
@@ -289,9 +303,6 @@ def main():
     start       = time.time()
 
     for epoch in range(args.epochs):
-        # Reseed dataset so this epoch draws different negatives
-        dataset.reseed(epoch)
-
         dataloader = DataLoader(
             dataset,
             shuffle=True,
@@ -304,22 +315,20 @@ def main():
         n_steps    = 0
 
         for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}", leave=False):
-            # Encode the three texts in each InputExample
-            texts_a = [ex.texts[0] for ex in batch]
-            texts_p = [ex.texts[1] for ex in batch]
-            texts_n = [ex.texts[2] for ex in batch]
+            batch = [ex for group in batch for ex in (group if isinstance(group, list) else [group])]
+            texts_a = [ex.texts[0] for ex in batch] #anchor text
+            texts_p = [ex.texts[1] for ex in batch] #positive text
+            texts_n = [ex.texts[2] for ex in batch] #negative text
 
-            # Get sentence embeddings through the model
-            features_a = model.tokenize(texts_a)
-            features_p = model.tokenize(texts_p)
-            features_n = model.tokenize(texts_n)
+            features_a = model.tokenize(texts_a) #anchor tokenized
+            features_p = model.tokenize(texts_p) #positive tokenized
+            features_n = model.tokenize(texts_n) #negative tokenized
 
             for feat in [features_a, features_p, features_n]:
                 for k in feat:
-                    if isinstance(feat[k], torch.Tensor):
+                    if isinstance(feat[k], torch.Tensor): 
                         feat[k] = feat[k].to(device)
 
-            
             loss = train_loss(
                 [features_a, features_p, features_n],
                 labels=None,
@@ -335,7 +344,6 @@ def main():
 
         avg_loss = epoch_loss / max(1, n_steps)
 
-        # Evaluate
         score = evaluator(model, output_path=str(eval_dir), epoch=epoch, steps=-1)
         print(f"  Epoch {epoch+1}/{args.epochs}  loss={avg_loss:.4f}  "
               f"triplet_acc={score:.4f}")
@@ -350,26 +358,33 @@ def main():
 
     # ── Save config + results ──────────────────────────────────────────
     config = {
-        "loss":                  "TripletLoss",
-        "triplet_margin":        0.5,
-        "distance_metric":       "cosine",
-        "negative_strategy":     "grouped per-anchor, one drawn per epoch",
-        "base_model":            args.base_model,
-        "epochs":                args.epochs,
-        "batch_size":            args.batch_size,
-        "warmup_steps":          args.warmup_steps,
-        "max_groups":            args.max_groups,
-        "seed":                  args.seed,
-        "device":                device,
-        "marker_tokens":         MARKER_TOKENS,
-        "train_groups_used":     len(train_groups),
-        "training_time_minutes": round(train_time / 60, 1),
+        "category":               args.category,
+        "loss":                   "TripletLoss",
+        "triplet_margin":         0.5,
+        "distance_metric":        "cosine",
+        "negative_strategy":      (
+            "grouped per-anchor even distribution at data-prep time "
+            f"(prepare_data.py); k={args.k_negatives} negatives sampled "
+            "ONCE per group at dataset construction, NOT resampled per epoch"
+        ),
+        "k_negatives":            args.k_negatives,
+        "base_model":             args.base_model,
+        "epochs":                 args.epochs,
+        "batch_size":             args.batch_size,
+        "warmup_steps":           args.warmup_steps,
+        "max_groups":             args.max_groups,
+        "seed":                   args.seed,
+        "device":                 device,
+        "marker_tokens":          MARKER_TOKENS,
+        "train_groups_used":      len(train_groups),
+        "training_time_minutes":  round(train_time / 60, 1),
     }
     with open(output_dir / "config.yaml", "w") as f:
         yaml.dump(config, f, default_flow_style=False)
 
     results = {
         "run":                   run_name,
+        "category":              args.category,
         "best_triplet_accuracy": round(best_score, 4),
         "training_time_minutes": round(train_time / 60, 1),
         "recall_at_k":           "to be filled by build_index.py",
