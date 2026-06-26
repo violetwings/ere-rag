@@ -1,0 +1,31 @@
+{
+  "cache_dir": "experiments/retriever/causal/grouped_causal_k5_seed42_ep5_bs16_mg5000_cpu/cache",
+  "llm_backend": "api",
+  "llm_model": "qwen3-next-80b-a3b-instruct",
+  "prompt_version": "llmere_few_shot_no_rationale",
+  "relation_type": "causal",
+  "query_scope": "all_heads",
+  "k": null,
+  "percentage": 1.0,
+  "partition_size": 20,
+  "n_docs": 20,
+  "n_predictions": 21554,
+  "metrics": {
+    "overall": {
+      "precision": 0.014,
+      "recall": 0.1948,
+      "f1": 0.0261
+    },
+    "causal": {
+      "precision": 0.014,
+      "recall": 0.1948,
+      "f1": 0.0261
+    }
+  },
+  "timing": {
+    "total_s": 1077.7,
+    "per_doc_s": 53.88,
+    "llm_n_calls": 1320,
+    "avg_llm_call_s": 0.81
+  }
+}

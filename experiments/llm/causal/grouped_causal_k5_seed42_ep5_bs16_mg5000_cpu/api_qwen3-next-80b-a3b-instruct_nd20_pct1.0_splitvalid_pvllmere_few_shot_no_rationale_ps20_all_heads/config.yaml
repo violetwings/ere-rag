@@ -1,0 +1,51 @@
+run:
+  created_at: "2026-06-21 17:32:36 +0200"
+  output_dir: experiments/llm/causal/grouped_causal_k5_seed42_ep5_bs16_mg5000_cpu/api_qwen3-next-80b-a3b-instruct_nd20_pct1.0_splitvalid_pvllmere_few_shot_no_rationale_ps20_all_heads
+  cutoff_tag: pct1.0
+paths:
+  run_dir: experiments/retriever/causal/grouped_causal_k5_seed42_ep5_bs16_mg5000_cpu
+  cache_dir: experiments/retriever/causal/grouped_causal_k5_seed42_ep5_bs16_mg5000_cpu/cache
+  processed_dir: data/processed
+data:
+  split: valid
+  n_available_docs: 710
+  n_selected_docs: 20
+  n_docs_requested: 20
+  sample_seed: 42
+  sampling: random_sample
+  selected_doc_ids:
+    - ee34efd94c9f0e9df8869c5ad4c4138c
+    - 273723a8c4698bbb938281663eb3162f
+    - 07390aa0fbe956fa8a6e80581e769958
+    - 683da139779fa2224394a7cfeddda27f
+    - 599dfb2a192503f7764876b2b932b54b
+    - 4f7eafff8fcc1d85715427307371346b
+    - 3218a3d46a01cbd13193e6e90ec947f5
+    - 241652a5be385efdee6dc4ad29fdbf3e
+    - fae6348117edee61f1389db9229bd1d5
+    - cd549dee25604bd81be1ca645227a3a4
+    - 1e499bc7a90659041ca30d066adcaeb7
+    - dd29856bbe0870c7df7fb93919f94108
+    - 9fc9d8553071d005c8d839039aae8840
+    - 0d63a2fc69c8479ba90d1e050c928277
+    - 0b1eb79a76481c78f4077ce6315979cb
+    - 2015edf358ab943cc93215eb4e0f64c7
+    - 4d79690291c4ab2f22e4c05077ffa68c
+    - 54c420daf99c96777c446381556c7123
+    - be0463896725281471fca7de5dcf1286
+    - e0f4f460e68c74365fbcc4f33e4aae64
+retrieval:
+  k: null
+  percentage: 1.0
+  partition_size: 20
+llm:
+  backend: api
+  model: qwen3-next-80b-a3b-instruct
+  max_new_tokens: 1600
+  temperature: 0.0
+prompt:
+  version: llmere_few_shot_no_rationale
+  relation_type: causal
+  query_scope: all_heads
+runtime:
+  verbose: false

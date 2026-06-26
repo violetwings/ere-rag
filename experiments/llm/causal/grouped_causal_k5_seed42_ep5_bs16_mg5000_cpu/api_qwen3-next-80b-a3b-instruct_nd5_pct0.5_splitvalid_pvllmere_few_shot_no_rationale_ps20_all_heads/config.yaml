@@ -1,0 +1,36 @@
+run:
+  created_at: "2026-06-21 15:22:41 +0200"
+  output_dir: experiments/llm/causal/grouped_causal_k5_seed42_ep5_bs16_mg5000_cpu/api_qwen3-next-80b-a3b-instruct_nd5_pct0.5_splitvalid_pvllmere_few_shot_no_rationale_ps20_all_heads
+  cutoff_tag: pct0.5
+paths:
+  run_dir: experiments/retriever/causal/grouped_causal_k5_seed42_ep5_bs16_mg5000_cpu
+  cache_dir: experiments/retriever/causal/grouped_causal_k5_seed42_ep5_bs16_mg5000_cpu/cache
+  processed_dir: data/processed
+data:
+  split: valid
+  n_available_docs: 710
+  n_selected_docs: 5
+  n_docs_requested: 5
+  sample_seed: 42
+  sampling: random_sample
+  selected_doc_ids:
+    - ee34efd94c9f0e9df8869c5ad4c4138c
+    - 273723a8c4698bbb938281663eb3162f
+    - 07390aa0fbe956fa8a6e80581e769958
+    - 683da139779fa2224394a7cfeddda27f
+    - 599dfb2a192503f7764876b2b932b54b
+retrieval:
+  k: null
+  percentage: 0.5
+  partition_size: 20
+llm:
+  backend: api
+  model: qwen3-next-80b-a3b-instruct
+  max_new_tokens: 1600
+  temperature: 0.0
+prompt:
+  version: llmere_few_shot_no_rationale
+  relation_type: causal
+  query_scope: all_heads
+runtime:
+  verbose: false
