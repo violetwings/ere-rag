@@ -61,6 +61,11 @@ experiments/*/*/test_prediction.jsonl
 experiments/*/*/best
 experiments/**/*.bin
 experiments/**/*.pt
+experiments/*/*/*/*/predictions.jsonl
+experiments/*/*/*/*/timing.jsonl
+experiments/*/*/*/model
+experiments/*/*/*/cache
+experiments/*/*/*/indices
 
 # Data files commonly kept outside git
 data/raw/*
@@ -95,15 +100,15 @@ docs/_build/
 # Local package manager files
 node_modules/
 
-# Retriever experimental / old / training variants
+# LLM experimental / old / training variants
 src/ere_rag/llm_drafts/
 
 # Retriever experimental / old / training variants
 src/ere_rag/retriever_drafts/
 
-# ignore experiment outputs
-experiments/llm/
-experiments/retriever/
+# Old experiments
+experiments/retriever_old/
+experiments/llm_old/
 
 #Kaggle related files
 .kaggleignore

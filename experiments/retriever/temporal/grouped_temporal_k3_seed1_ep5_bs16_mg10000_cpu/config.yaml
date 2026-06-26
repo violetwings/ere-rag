@@ -1,0 +1,20 @@
+base_model: all-MiniLM-L6-v2
+batch_size: 16
+category: temporal
+device: cpu
+distance_metric: cosine
+epochs: 5
+k_negatives: 3
+loss: TripletLoss
+marker_tokens:
+- <m>
+- </m>
+max_groups: 10000
+negative_strategy: grouped per-anchor even distribution at data-prep time (prepare_data.py);
+  k=3 negatives sampled ONCE per group at dataset construction, NOT resampled per
+  epoch
+seed: 1
+train_groups_used: 10000
+training_time_minutes: 203.4
+triplet_margin: 0.5
+warmup_steps: 100

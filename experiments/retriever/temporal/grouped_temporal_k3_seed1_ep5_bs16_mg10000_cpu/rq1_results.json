@@ -1,0 +1,51 @@
+{
+  "category": "temporal",
+  "model_path": "experiments/retriever/temporal/grouped_temporal_k3_seed1_ep5_bs16_mg10000_cpu/model",
+  "percentages": [
+    5,
+    10,
+    20,
+    30,
+    50,
+    60
+  ],
+  "scores": {
+    "5%": {
+      "precision": 0.4659,
+      "recall": 0.0739,
+      "f1": 0.1275,
+      "avg_retrieved": 2.1
+    },
+    "10%": {
+      "precision": 0.4408,
+      "recall": 0.1395,
+      "f1": 0.2119,
+      "avg_retrieved": 4.2
+    },
+    "20%": {
+      "precision": 0.4192,
+      "recall": 0.265,
+      "f1": 0.3248,
+      "avg_retrieved": 8.3
+    },
+    "30%": {
+      "precision": 0.4066,
+      "recall": 0.385,
+      "f1": 0.3955,
+      "avg_retrieved": 12.5
+    },
+    "50%": {
+      "precision": 0.386,
+      "recall": 0.61,
+      "f1": 0.4728,
+      "avg_retrieved": 20.8
+    },
+    "60%": {
+      "precision": 0.3744,
+      "recall": 0.7107,
+      "f1": 0.4905,
+      "avg_retrieved": 25.0
+    }
+  },
+  "time_sec": 338.5
+}

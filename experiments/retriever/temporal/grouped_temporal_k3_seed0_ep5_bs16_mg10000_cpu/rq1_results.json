@@ -1,0 +1,79 @@
+{
+  "category": "temporal",
+  "model_path": "experiments/retriever/temporal/grouped_temporal_k3_seed0_ep5_bs16_mg10000_cpu/model",
+  "percentages": [
+    5,
+    10,
+    20,
+    30,
+    50,
+    60,
+    70,
+    80,
+    90,
+    100
+  ],
+  "scores": {
+    "5%": {
+      "precision": 0.4574,
+      "recall": 0.0725,
+      "f1": 0.1252,
+      "avg_retrieved": 2.1
+    },
+    "10%": {
+      "precision": 0.4336,
+      "recall": 0.1372,
+      "f1": 0.2084,
+      "avg_retrieved": 4.2
+    },
+    "20%": {
+      "precision": 0.4137,
+      "recall": 0.2616,
+      "f1": 0.3205,
+      "avg_retrieved": 8.3
+    },
+    "30%": {
+      "precision": 0.4012,
+      "recall": 0.3799,
+      "f1": 0.3903,
+      "avg_retrieved": 12.5
+    },
+    "50%": {
+      "precision": 0.3776,
+      "recall": 0.5967,
+      "f1": 0.4625,
+      "avg_retrieved": 20.8
+    },
+    "60%": {
+      "precision": 0.3663,
+      "recall": 0.6952,
+      "f1": 0.4798,
+      "avg_retrieved": 25.0
+    },
+    "70%": {
+      "precision": 0.3553,
+      "recall": 0.7861,
+      "f1": 0.4894,
+      "avg_retrieved": 29.1
+    },
+    "80%": {
+      "precision": 0.3435,
+      "recall": 0.8686,
+      "f1": 0.4924,
+      "avg_retrieved": 33.3
+    },
+    "90%": {
+      "precision": 0.3303,
+      "recall": 0.9393,
+      "f1": 0.4888,
+      "avg_retrieved": 37.4
+    },
+    "100%": {
+      "precision": 0.3164,
+      "recall": 1.0,
+      "f1": 0.4807,
+      "avg_retrieved": 41.6
+    }
+  },
+  "time_sec": 306.6
+}

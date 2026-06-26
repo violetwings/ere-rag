@@ -1,0 +1,7 @@
+{
+  "run": "grouped_temporal_k3_seed0_ep5_bs16_mg10000_cpu",
+  "category": "temporal",
+  "best_triplet_accuracy": 0.55,
+  "training_time_minutes": 95.5,
+  "recall_at_k": "to be filled by build_index.py"
+}

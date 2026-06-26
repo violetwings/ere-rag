@@ -1,0 +1,7 @@
+{
+  "run": "grouped_causal_k5_seed42_ep5_bs16_mg5000_cpu",
+  "category": "causal",
+  "best_triplet_accuracy": 0.74,
+  "training_time_minutes": 107.6,
+  "recall_at_k": "to be filled by build_index.py"
+}

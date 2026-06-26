@@ -35,7 +35,7 @@ inconsistently across papers and not directly comparable:
 
 All numbers in this project use the *all event pairs* setting, matching
 the RoBERTa baseline [1] we reproduce. Efficient ERE's F1=32.8 is not
-directly comparable to LLMERE's temporal F1=54.7 or our numbers for this
+directly comparable to LLMERE's temporal F1=54.8 or our numbers for this
 reason. We note that LLMERE's own evaluation script uses a further
 re-split: they shuffle the official MAVEN-ERE train split 80/20 into
 their own working train and valid, and treat the official MAVEN-ERE valid
