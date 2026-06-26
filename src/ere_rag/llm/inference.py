@@ -1,179 +1,200 @@
 """
 inference.py
 
-LLM inference backend for the ERE pipeline.
-Supports four backends: "ollama", "local", "small", "api"
+Backend initialization and inference helpers for the ERE LLM stage.
+
+Supported backends:
+  - groq: Groq chat completions
+  - api: generic OpenAI-compatible chat completions endpoint
+  - ollama: local Ollama chat/generate
+  - hf: HuggingFace text-generation pipeline
+
+For the generic API backend, set:
+  ERE_LLM_API_BASE=https://the-endpoint/v1
+  ERE_LLM_API_KEY=...
 """
 
+from __future__ import annotations
+
 import os
+import re
 import time
-import torch
 
-# ── Module-level state ──────────────────────────────────────────────────────
-_backend      = None   # "ollama" | "local" | "small" | "api"
-_tokenizer    = None
-_model        = None
-_device       = None
-_api_client   = None
-_api_model    = None
-_ollama_model = None
+SYSTEM_PROMPT = (
+    "You are an expert linguist performing event relation extraction. "
+    "Follow the requested output format exactly and do not add unrelated commentary."
+)
 
-# ── Device detection ────────────────────────────────────────────────────────
-def _detect_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+_backend: str | None = None
+_client = None
+_model: str | None = None
+_hf_pipeline = None
 
-# ── Loader ──────────────────────────────────────────────────────────────────
-def load_model(
-    backend:    str  = "ollama",
-    model_name: str  = "llama3",
-    device:     str  = "cpu",
-    use_4bit:   bool = False,
-) -> None:
-    """Load the chosen backend into module-level globals."""
-    global _backend, _tokenizer, _model, _device, _api_client, _api_model, _ollama_model
 
-    _backend = backend
-    _device = device
+def load_model(backend: str, model_name: str, device: str = "cpu") -> None:
+    global _backend, _client, _model, _hf_pipeline
 
-    if backend == "ollama":
-        try:
-            import ollama
-            _ollama_model = model_name
-            print(f"✓ Connected to local Ollama backend (model: {_ollama_model})")
-            return
-        except ImportError:
-            print(" ollama package not installed. Run: pip install ollama")
-            print("WARNING: ollama not available, falling back to 'small' backend — results will differ!")
-            backend = "small"
-            _backend = "small"
+    _backend = backend.lower()
+    _model = model_name
 
-    if backend == "api":
-        try:
-            _load_api_backend(model_name)
-            print(f"✓ Loaded Anthropic Claude API backend")
-            return
-        except ImportError as e:
-            print(f" {e}")
-            print("Falling back to 'small' backend...")
-            backend = "small"
-            _backend = "small"
+    if _backend == "groq":
+        from groq import Groq
 
-    if backend in ("small", "local"):
-        print(f"Loading {model_name}...")
-        from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError("GROQ_API_KEY must be set for --llm_backend groq")
+        _client = Groq(api_key=api_key, timeout=120.0)
+        print(f"Connected to Groq API (model: {_model})")
 
-        resolved = _detect_device() if device == "auto" else device
-        _device  = resolved
+    elif _backend == "api":
+        from openai import OpenAI
 
-        _tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        if _tokenizer.pad_token is None:
-            _tokenizer.pad_token = _tokenizer.eos_token
-
-        if resolved == "cuda" and use_4bit:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.float16,
+        api_key = os.environ.get("ERE_LLM_API_KEY")
+        base_url = os.environ.get("ERE_LLM_API_BASE")
+        if not api_key or not base_url:
+            raise RuntimeError(
+                "ERE_LLM_API_KEY and ERE_LLM_API_BASE must both be set for --llm_backend api"
             )
-            _model = AutoModelForCausalLM.from_pretrained(
-                model_name, quantization_config=bnb_config, device_map="auto", trust_remote_code=True
-            )
-        elif resolved == "mps":
-            _model = AutoModelForCausalLM.from_pretrained(
-                model_name, torch_dtype=torch.float16, trust_remote_code=True
-            ).to("mps")
-        else:
-            _model = AutoModelForCausalLM.from_pretrained(
-                model_name, torch_dtype=torch.float32, trust_remote_code=True
-            )
+        _client = OpenAI(api_key=api_key, base_url=base_url, timeout=120.0)
+        print(f"Connected to OpenAI-compatible API at {base_url} (model: {_model})")
 
-        _model.eval()
-        print(f"  Loaded. Parameters: ~{sum(p.numel() for p in _model.parameters())/1e9:.1f}B")
+    elif _backend == "ollama":
+        import ollama
 
-def _load_api_backend(model_name: str):
-    try:
-        import anthropic
-    except ImportError:
-        raise ImportError("anthropic package not installed. Run: pip install anthropic")
-    
-    global _api_client, _api_model
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY not set.")
-    
-    _api_client = anthropic.Anthropic(api_key=api_key)
-    _api_model = model_name
+        _client = ollama
+        print(f"Connected to Ollama (model: {_model})")
+
+    elif _backend == "hf":
+        from transformers import pipeline
+
+        device_id = 0 if device == "cuda" else -1
+        _hf_pipeline = pipeline("text-generation", model=_model, device=device_id)
+        print(f"Loaded HuggingFace text-generation pipeline (model: {_model})")
+
+    else:
+        raise ValueError(f"Unsupported backend: {backend}")
+
 
 def is_loaded() -> bool:
-    if _backend == "ollama":
-        return _ollama_model is not None
-    if _backend == "api":
-        return _api_client is not None
-    return _model is not None and _tokenizer is not None
+    return _backend is not None
 
-# ── Inference ───────────────────────────────────────────────────────────────
+
 def run_inference(
-    prompt:         str,
-    max_new_tokens: int   = 128,
-    temperature:    float = 0.0,
+    prompt: str,
+    max_new_tokens: int = 1600,
+    temperature: float = 0.0,
+    system_prompt: str = SYSTEM_PROMPT,
 ) -> tuple[str, float]:
     if not is_loaded():
         raise RuntimeError("Backend not loaded. Call load_model() first.")
 
+    if _backend == "groq":
+        return _run_chat_completions(prompt, max_new_tokens, temperature, system_prompt, provider="groq")
+    if _backend == "api":
+        return _run_chat_completions(prompt, max_new_tokens, temperature, system_prompt, provider="api")
     if _backend == "ollama":
-        return _run_ollama(prompt, temperature)
-    elif _backend == "api":
-        return _run_api(prompt, max_new_tokens, temperature)
+        return _run_ollama(prompt, max_new_tokens, temperature, system_prompt)
+    if _backend == "hf":
+        return _run_hf(prompt, max_new_tokens, temperature, system_prompt)
+
+    raise RuntimeError(f"Unknown loaded backend: {_backend}")
+
+
+def _parse_retry_delay(error_text: str, default: float = 5.0) -> float:
+    match = re.search(r"[Pp]lease try again in ([0-9a-zA-Z.\s]+)", error_text)
+    if not match:
+        return default
+
+    text = match.group(1).lower()
+
+    minutes_seconds = re.search(r"(?:(\d+(?:\.\d+)?)m)?\s*(?:(\d+(?:\.\d+)?)s)?", text)
+    if minutes_seconds and (minutes_seconds.group(1) or minutes_seconds.group(2)):
+        minutes = float(minutes_seconds.group(1) or 0.0)
+        seconds = float(minutes_seconds.group(2) or 0.0)
+        return minutes * 60.0 + seconds
+
+    milliseconds = re.search(r"(\d+(?:\.\d+)?)\s*ms", text)
+    if milliseconds:
+        return float(milliseconds.group(1)) / 1000.0
+
+    seconds = re.search(r"(\d+(?:\.\d+)?)\s*s", text)
+    if seconds:
+        return float(seconds.group(1))
+
+    return default
+
+
+def _run_chat_completions(
+    prompt: str,
+    max_new_tokens: int,
+    temperature: float,
+    system_prompt: str,
+    provider: str,
+) -> tuple[str, float]:
+    start = time.time()
+    max_retries = 8 if provider == "groq" else 6
+
+    if provider == "groq":
+        import groq
+
+        rate_limit_error = groq.RateLimitError
+        transient_errors = (groq.APITimeoutError, groq.APIConnectionError)
     else:
-        return _run_hf(prompt, max_new_tokens, temperature)
+        import openai
 
-def _run_ollama(prompt: str, temperature: float) -> tuple[str, float]:
-    import ollama
+        rate_limit_error = openai.RateLimitError
+        transient_errors = (openai.APITimeoutError, openai.APIConnectionError)
+
+    for attempt in range(max_retries):
+        try:
+            response = _client.chat.completions.create(
+                model=_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                max_tokens=max_new_tokens,
+            )
+            elapsed = time.time() - start
+            text = response.choices[0].message.content or ""
+            return text.strip(), elapsed
+
+        except rate_limit_error as exc:
+            delay = _parse_retry_delay(str(exc)) + 1.0
+            print(f"\n[{provider} rate limit] sleeping {delay:.2f}s (attempt {attempt + 1}/{max_retries})")
+            time.sleep(delay)
+
+        except transient_errors as exc:
+            print(f"\n[{provider} {type(exc).__name__}] retrying in 5s (attempt {attempt + 1}/{max_retries})")
+            time.sleep(5.0)
+
+    raise RuntimeError(f"Exceeded maximum retries for {provider} backend")
+
+
+def _run_ollama(
+    prompt: str,
+    max_new_tokens: int,
+    temperature: float,
+    system_prompt: str,
+) -> tuple[str, float]:
     start = time.time()
-    response = ollama.chat(
-        model=_ollama_model, 
-        messages=[{'role': 'user', 'content': prompt}],
-        options={'temperature': temperature}
+    options = {"temperature": temperature, "num_predict": max_new_tokens}
+
+    if hasattr(_client, "chat"):
+        response = _client.chat(
+            model=_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            options=options,
+        )
+        elapsed = time.time() - start
+        return response["message"]["content"].strip(), elapsed
+
+    response = _client.generate(
+        model=_model,
+        prompt=f"{system_prompt}\n\n{prompt}",
+        options=options,
     )
-    elapsed = time.time() - start
-    return response['message']['content'].strip(), elapsed
-
-def _run_hf(prompt: str, max_new_tokens: int, temperature: float) -> tuple[str, float]:
-    messages = [{"role": "user", "content": prompt}]
-    formatted = _tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    inputs = _tokenizer(formatted, return_tensors="pt", truncation=True, max_length=2048)
-    if _device in ("cuda", "mps"):
-        inputs = {k: v.to(_device) for k, v in inputs.items()}
-    prompt_len = inputs["input_ids"].shape[1]
-
-    start = time.time()
-    with torch.no_grad():
-        if temperature == 0.0:
-            outputs = _model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-        else:
-            outputs = _model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=True, temperature=temperature)
-    elapsed = time.time() - start
-
-    new_tokens = outputs[0][prompt_len:]
-    response   = _tokenizer.decode(new_tokens, skip_special_tokens=True)
-    return response.strip(), elapsed
-
-def _run_api(prompt: str, max_new_tokens: int, temperature: float) -> tuple[str, float]:
-    start = time.time()
-    message = _api_client.messages.create(
-        model=_api_model,
-        max_tokens=max_new_tokens,
-        temperature=max(temperature, 0.0),
-        messages=[{"role": "user", "content": prompt}],
-    )
-    elapsed  = time.time() - start
-    return message.content[0].text.strip(), elapsed
