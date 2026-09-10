@@ -250,17 +250,6 @@ seed=42 retriever model.
 
 ### Genuine implementation gaps (limitations, not contributions)
 
-- **Document context not included**: LLMERE feeds the full document into
-  every prompt, with all events marked by sequential ids. This pipeline
-  provides only per-event sentence snippets from the retrieval cache.
-  Full-document context was omitted due to two compounding constraints:
-  (1) early experiments used Groq API which enforced tight tokens-per-minute
-  limits, forcing shorter prompts; (2) the retriever cache does not store
-  full document text. A hook for document context exists in `prompt.py`
-  but is not populated. This likely explains part of any performance gap
-  versus LLMERE's reported numbers. Adding full document context is a
-  planned improvement.
-
 - **Candidate order not preserved**: LLMERE includes the full document so
   the LLM sees events in their original document order. Our retrieval stage
   reorders candidates by embedding similarity, so candidates presented to
@@ -386,9 +375,6 @@ not.
 
 - **Candidate order not preserved** (construct validity): see Implementation
   Gaps above.
-
-- **Document context absent** (construct validity): see Implementation Gaps
-  above.
 
 - **Prompt sensitivity** (construct validity): final prompt versions are
   reasonable but not exhaustively optimised. Results may improve with

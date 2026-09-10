@@ -1,0 +1,23 @@
+{
+  "mode": "per_query_retriever",
+  "llm_backend": "api",
+  "llm_model": "qwen3-next-80b-a3b-instruct",
+  "percentage": 0.6,
+  "k": null,
+  "n_docs": 20,
+  "n_predictions": 1827,
+  "metrics": {
+    "precision": 0.1029,
+    "recall": 0.5646,
+    "f1": 0.1741,
+    "tp": 188,
+    "fp": 1639,
+    "fn": 145
+  },
+  "timing": {
+    "total_s": 247.3,
+    "per_doc_s": 12.36,
+    "llm_n_calls": 443,
+    "avg_llm_call_s": 0.56
+  }
+}

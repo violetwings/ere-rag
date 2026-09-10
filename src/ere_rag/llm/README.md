@@ -37,7 +37,7 @@ export ERE_LLM_API_BASE="https://your-endpoint/v1"
 
 ## Running
 
-Final RQ2/RQ3 configuration (see `EXPERIMENT_PLAN.md` for the full
+Final RQ2/RQ3 configuration (see `experiment-plan-m1.md` for the full
 4-config-per-relation-type design and reasoning):
 
 ```bash
@@ -73,16 +73,3 @@ experiments/llm/<relation_type>/<retriever_run_name>/
     ├── timing.jsonl        # per-call timing
     └── results.json        # aggregate P/R/F1 + timing summary
 ```
-
-## Known limitations
-
-- `document_context` (full-document context in the prompt, as LLMERE uses)
-  is wired into `prompt.py` but not yet populated — the retriever
-  cache only stores per-event wrapped sentences, not full document text.
-  Left in place as a no-op rather than removed, since it's harmless and the
-  cache could be extended to populate it later (see `docs/methodology.md`,
-  Threats to Validity).
-- `query_scope=positive_heads` exists for faster piloting but is **not**
-  used for any reported result — it silently drops zero-positive queries
-  and documents, which biases precision and isn't a representative test
-  setup. Final runs always use `all_heads`.

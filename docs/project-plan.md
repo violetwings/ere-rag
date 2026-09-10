@@ -50,9 +50,7 @@ detail):
 - LLMERE derives rationales from structured dataset annotations (transitive
   chains from ground-truth event graphs). This work uses LLM-generated
   free-text rationales, which is closer to chain-of-thought prompting.
-- LLMERE includes the full document in each prompt. This work uses only
-  per-event sentence snippets from the retrieval cache (full context is
-  a planned addition).
+
 
 ---
 

@@ -6,6 +6,16 @@ Usage :  python src/ere_rag/data/temporal_stats.py --data_path data/raw/MAVEN_ER
 import json
 from collections import defaultdict
 
+REL2ID = {
+    "BEFORE": 0,
+    "OVERLAP": 1,
+    "CONTAINS": 2,
+    "SIMULTANEOUS": 3,
+    "ENDS-ON": 4,
+    "BEGINS-ON": 5,
+    "NONE": 6,
+}
+
 def load_docs(path):
     with open(path) as f:
         for line in f:
@@ -14,59 +24,74 @@ def load_docs(path):
 def build_directed_graph(doc):
     out_adj = defaultdict(set)
     in_adj = defaultdict(set)
+    n_positives = 0
+        
+    events = set()
+    eid2mentions = {}
+    if "events" in doc:
+        for e in doc["events"]:
+            events.add(e["mention"][k["id"]] for k in e["mention"])
+            eid2mentions[e["id"]] = [
+                m["id"] for m in e["mention"]
+            ]
+        relations = doc["temporal_relations"]
+    else:
+        events = doc["event_mentions"]
+        relations = {}
+    for t in doc["TIMEX"]:
+        events.add(t["id"])
+        eid2mentions[t["id"]] = [t["id"]]
     
 
-    if "temporal_relations" not in doc:
-        return out_adj, in_adj
-
-    for rel_type, pairs in doc["temporal_relations"].items():
-        for e1, e2 in pairs:
-            out_adj[e1].add(e2)
-            in_adj[e2].add(e1)
-            if rel_type in ["SIMULTANEOUS", "BEGINS-ON"]:
-                out_adj[e2].add(e1)
-                in_adj[e1].add(e2)
-
-    return out_adj, in_adj
+    pair2rel = {}
+    for rel in relations:
+        for pair in relations[rel]:
+            for e1 in eid2mentions[pair[0]]:
+                for e2 in eid2mentions[pair[1]]:
+                    pair2rel[(e1, e2)] = REL2ID[rel]
+                    out_adj[e1].add(e2)
+                    in_adj[e2].add(e1)
+                    n_positives += 1
+                    if rel in ["SIMULTANEOUS", "BEGINS-ON"]:
+                        pair2rel[(e2, e1)] = REL2ID[rel]
+                        out_adj[e2].add(e1)
+                        in_adj[e1].add(e2)
+                        n_positives += 1
+    
+    percentage_positive =  0.0
+    for e in events:
+        positives = 0
+        if e in out_adj:
+            positives = len(out_adj[e])
+        percentage_positive += positives / (len(events) - 1) if len(events) > 1 else 0.0
+    
+    return n_positives ,len(events),n_positives/len(events), percentage_positive
 
 def stats(path):
-    all_in, all_out, all_norm_degrees, all_not_out = [], [], [], []
     total_events = 0
     total_docs = 0
+    total_sum_out_adj = 0
+   
+    total_norm_out_adj = 0
+    total_not_out = 0
+    total_percentage_positive = 0.0
     for doc in load_docs(path):
         total_docs += 1
-        out_adj, in_adj = build_directed_graph(doc)
-
-        events = set()
-        if "events" in doc:
-            for e in doc["events"]:
-                events.add(e["id"])
-        else:
-            for e in doc["event_mentions"]:
-                events.add(e["id"])
-        n = len(events)
-        total_events += n
-        for e in events:
-            all_out.append(len(out_adj[e]))
-            all_not_out.append(n - 1 - len(out_adj[e]))
-            all_in.append(len(in_adj[e]))
-            if n > 1:
-                all_norm_degrees.append(len(out_adj[e]) / (n - 1))
+        sum_out_adj,  num_events, norm_out_adj, percentage_positives = build_directed_graph(doc)
+        total_not_out += num_events**2 - num_events - sum_out_adj
+        total_events += num_events
+        total_sum_out_adj += sum_out_adj
+        
+        total_norm_out_adj += norm_out_adj
+        total_percentage_positive += percentage_positives
 
     return {
-        "avg_in": sum(all_in)/len(all_in),
-        "avg_out": sum(all_out)/len(all_out),
-        "max_in": max(all_in),
-        "max_out": max(all_out),
-        "min_in": min(all_in),
-        "min_out": min(all_out),
-        "avg_norm_degree": sum(all_norm_degrees)/len(all_norm_degrees),
-        "max_norm_degree": max(all_norm_degrees),
-        "min_norm_degree": min(all_norm_degrees),
-        "avg_not_out": sum(all_not_out)/len(all_not_out),
-        "max_not_out": max(all_not_out),
-        "min_not_out": min(all_not_out),
+       
+        "avg_out": total_sum_out_adj/total_events,
+        "avg_norm_degree": total_norm_out_adj/total_docs,
+        "avg_not_out": total_not_out/total_events,
         "avg_events": total_events/total_docs,
+        "avg_percentage_positive": total_percentage_positive/total_events,
     }
 if __name__ == "__main__":
     import argparse
